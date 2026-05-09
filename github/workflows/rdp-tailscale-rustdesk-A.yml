@@ -1,0 +1,256 @@
+name: 💻 Full Session (A) – RDP + Tailscale + RustDesk + B2
+
+on:
+  workflow_dispatch:
+    inputs:
+      ts_tailnet:
+        description: "Tailscale tailnet (ex: you@gmail.com)"
+        required: true
+      ts_api_key:
+        description: "Tailscale API key (device admin)"
+        required: true
+      ts_authkey:
+        description: "Tailscale Auth key (reusable)"
+        required: true
+      runtime_minutes:
+        description: "Durée max (max 355)"
+        required: false
+        default: "355"
+      enable_sync:
+        description: "Activer la synchronisation B2 ? (true/false)"
+        required: false
+        default: "true"
+      session_id:
+        description: "ID de session (fourni par le bot)"
+        required: false
+        default: "manual"
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+      multi:  ${{ steps.mk.outputs.multi }}
+    steps:
+      - id: mk
+        run: |
+          $n = 1
+          $inc = @(); for ($i=1; $i -le $n; $i++){ $inc += @{ id = $i } }
+          $json = @{ include = $inc } | ConvertTo-Json -Compress
+          "matrix=$json" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "multi=0" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+  rdp:
+    needs: setup
+    runs-on: windows-latest
+    strategy:
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+      max-parallel: 10
+    timeout-minutes: 370
+    env:
+      RDP_USER: Bullettemporary
+      RDP_PASS: ${{ secrets.RDP_PASSWORD }}
+      TS_HOSTNAME: bullet
+
+    steps:
+      # ------ Restauration B2 ------
+      - name: Restaurer les données depuis B2
+        env:
+          B2_APPLICATION_KEY_ID: ${{ secrets.B2_APPLICATION_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
+          B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
+        run: |
+          Write-Host "📥 Restauration des données..."
+          Invoke-WebRequest -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile "$env:TEMP\rclone.zip"
+          Expand-Archive -Path "$env:TEMP\rclone.zip" -DestinationPath "$env:TEMP\rclone" -Force
+          $rclone = (Get-ChildItem "$env:TEMP\rclone\rclone-*\rclone.exe" | Select-Object -First 1).FullName
+          & $rclone config create myb2 b2 account="$env:B2_APPLICATION_KEY_ID" key="$env:B2_APPLICATION_KEY" endpoint="$env:B2_ENDPOINT"
+          $check = & $rclone lsf "myb2:$env:B2_BUCKET_NAME/userdata" 2>$null
+          if ($check) {
+            Write-Host "📂 Données trouvées, restauration en cours..."
+            & $rclone copy "myb2:$env:B2_BUCKET_NAME/userdata" "C:\Users\$env:RDP_USER" --create-empty-src-dirs
+            Write-Host "✅ Restauration terminée."
+          } else {
+            Write-Host "🆕 Aucune sauvegarde trouvée, premier démarrage."
+          }
+
+      # ------ Assouplissements Windows Server ------
+      - name: Assouplir les restrictions Windows Server
+        run: |
+          Write-Host "🔧 Configuration de l'environnement..."
+          Set-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "EnableLUA" -Value 0
+          Set-MpPreference -DisableRealtimeMonitoring $true
+          Set-ExecutionPolicy -ExecutionPolicy Unrestricted -Scope LocalMachine -Force
+          Write-Host "✅ Environnement assoupli."
+
+      # ------ Purge Tailscale ------
+      - name: Purge bullet* devices
+        run: |
+          Write-Host "🧹 Purge des anciens devices Tailscale..."
+          $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${{ inputs.ts_api_key }}:"))
+          $tn = [uri]::EscapeDataString("${{ inputs.ts_tailnet }}")
+          $list = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Headers @{ Authorization = "Basic $auth" }
+          foreach($d in $list.devices){
+            if ($d.hostname -match '^bullet$'){
+              Invoke-RestMethod -Method Delete -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers @{ Authorization = "Basic $auth" } -ErrorAction SilentlyContinue
+            }
+          }
+          Write-Host "✅ Purge terminée."
+
+      # ------ Installation Tailscale ------
+      - name: Installer et connecter Tailscale
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $ts)) {
+            $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+            $dst = "$env:TEMP\tailscale.msi"
+            Invoke-WebRequest -Uri $url -OutFile $dst
+            Start-Process msiexec.exe -ArgumentList "/i","`"$dst`"","/quiet","/norestart" -Wait
+            Remove-Item $dst -Force
+          }
+          & $ts logout 2>$null
+          & $ts up --authkey "${{ inputs.ts_authkey }}" --hostname "$env:TS_HOSTNAME" --accept-dns=true --accept-routes=true
+          $ip4 = & $ts ip -4 | Select-Object -First 1
+          "TAILSCALE_IP=$ip4" | Out-File -Append $env:GITHUB_ENV
+          Write-Host "✅ Tailscale connecté : $ip4"
+
+      # ------ Activation RDP ------
+      - name: Activer RDP et créer l'utilisateur
+        run: |
+          $u=$env:RDP_USER; $p=$env:RDP_PASS
+          $sec = ConvertTo-SecureString $p -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Add-LocalGroupMember -Group "Administrators" -Member $u
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+          } else {
+            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Enable-LocalUser -Name $u
+            Add-LocalGroupMember -Group "Administrators" -Member $u -ErrorAction SilentlyContinue
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u -ErrorAction SilentlyContinue
+          }
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+          Write-Host "✅ RDP activé."
+
+      # ------ Installation RustDesk ------
+      - name: Installer RustDesk
+        run: |
+          $rdExe = "C:\Program Files\RustDesk\rustdesk.exe"
+          if (-not (Test-Path $rdExe)) {
+            try {
+              $rdUrl = "https://github.com/rustdesk/rustdesk/releases/download/1.3.1/rustdesk-1.3.1-x86_64.msi"
+              $installerPath = "$env:TEMP\rustdesk.msi"
+              Invoke-WebRequest -Uri $rdUrl -OutFile $installerPath
+              Start-Process msiexec.exe -ArgumentList "/i","`"$installerPath`"","/quiet","/norestart" -Wait
+              Remove-Item $installerPath -Force
+            } catch {
+              winget install --id RustDesk.RustDesk -e --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
+            }
+          }
+          Start-Process -FilePath $rdExe -ErrorAction SilentlyContinue
+          Write-Host "✅ RustDesk lancé."
+
+      # ------ Keep-alive + Sync B2 ------
+      - name: Keep alive + synchronisation B2
+        env:
+          B2_APPLICATION_KEY_ID: ${{ secrets.B2_APPLICATION_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
+          B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NOTIFY_TOKEN: ${{ secrets.NOTIFY_TOKEN }}
+          RENDER_URL: ${{ secrets.RENDER_URL }}
+        run: |
+          $runtime = [int]"${{ inputs.runtime_minutes }}"
+          $endTime = (Get-Date).AddMinutes($runtime)
+          $syncEnabled = "${{ inputs.enable_sync }}" -eq 'true'
+
+          # Notification de démarrage
+          if ($env:RENDER_URL -and $env:NOTIFY_TOKEN) {
+            $body = @{ event="session_demarree"; data="IP: $env:TAILSCALE_IP" } | ConvertTo-Json
+            Invoke-RestMethod -Uri "$env:RENDER_URL/notify" -Method Post -Headers @{ Authorization = "Bearer $env:NOTIFY_TOKEN" } -Body $body -ContentType "application/json"
+          }
+
+          while ((Get-Date) -lt $endTime) {
+            if ($syncEnabled) {
+              Write-Host "💾 Sync B2..."
+              & $rclone sync "C:\Users\$env:RDP_USER" "myb2:$env:B2_BUCKET_NAME/userdata" --create-empty-src-dirs --fast-list
+              Write-Host "✅ Sync OK"
+            }
+
+            # Vérifier le signal d'arrêt
+            if ($syncEnabled) {
+              $stopSignal = & $rclone lsf "myb2:$env:B2_BUCKET_NAME/stop-now.lock" 2>$null
+              if ($stopSignal) {
+                Write-Host "🛑 Signal d'arrêt détecté !"
+                & $rclone delete "myb2:$env:B2_BUCKET_NAME/stop-now.lock"
+                break
+              }
+            }
+
+            Start-Sleep -Seconds 300
+          }
+
+      # ------ Sauvegarde finale ------
+      - name: Sauvegarde finale et notification
+        if: always()
+        env:
+          B2_APPLICATION_KEY_ID: ${{ secrets.B2_APPLICATION_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
+          B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
+          NOTIFY_TOKEN: ${{ secrets.NOTIFY_TOKEN }}
+          RENDER_URL: ${{ secrets.RENDER_URL }}
+        run: |
+          Write-Host "📦 Sauvegarde finale..."
+          & $rclone sync "C:\Users\$env:RDP_USER" "myb2:$env:B2_BUCKET_NAME/userdata" --create-empty-src-dirs --fast-list
+          Write-Host "✅ Sauvegarde finale terminée."
+          if ($env:RENDER_URL -and $env:NOTIFY_TOKEN) {
+            $body = @{ event="sauvegarde_finale"; data="Sauvegarde terminée" } | ConvertTo-Json
+            Invoke-RestMethod -Uri "$env:RENDER_URL/notify" -Method Post -Headers @{ Authorization = "Bearer $env:NOTIFY_TOKEN" } -Body $body -ContentType "application/json"
+          }
+
+      # ------ Dispatch next or stop ------
+      - name: Dispatch next or stop
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $cycles = [int]"${{ inputs.cycles }}"
+          if ($cycles -gt 0) {
+            $next = $cycles - 1
+            if ($next -le 0) {
+              $url = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-stop.yml/dispatches"
+              $hdr = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
+              $payload = @{ ts_tailnet="${{ inputs.ts_tailnet }}"; ts_api_key="${{ inputs.ts_api_key }}"; base_prefix="bullet"; max_count="10"; dry_run="false" }
+              $body = @{ ref="${{ github.ref_name }}"; inputs=$payload } | ConvertTo-Json -Depth 20
+              Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -Body $body | Out-Null
+              Write-Host "Dispatched STOP."
+            } else {
+              $payload = @{
+                ts_tailnet      = "${{ inputs.ts_tailnet }}"
+                ts_api_key      = "${{ inputs.ts_api_key }}"
+                ts_authkey      = "${{ inputs.ts_authkey }}"
+                runtime_minutes = "${{ inputs.runtime_minutes }}"
+                enable_sync     = "${{ inputs.enable_sync }}"
+                cycles          = "$next"
+                session_id      = "${{ inputs.session_id }}"
+              }
+              $url2 = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-B.yml/dispatches"
+              $hdr2 = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
+              $body2 = @{ ref="${{ github.ref_name }}"; inputs=$payload } | ConvertTo-Json -Depth 20
+              Invoke-WebRequest -Method POST -Uri $url2 -Headers $hdr2 -Body $body2 | Out-Null
+              Write-Host "Dispatched Workflow B with cycles=$next"
+            }
+          } else { Write-Host "No cycles configured. Done." }
