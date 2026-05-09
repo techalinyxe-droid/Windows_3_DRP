@@ -90,21 +90,27 @@ jobs:
       TS_HOSTNAME: bullet
 
     steps:
-      # ------ RESTAURATION B2 + INSTALLATION RCLONE ------
-      - name: Restaurer les données depuis B2 et installer rclone
+      # ------ INSTALLER RCLONE ET RESTAURER ------
+      - name: Installer rclone et restaurer depuis B2
         env:
           B2_APPLICATION_KEY_ID: ${{ secrets.B2_APPLICATION_KEY_ID }}
           B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
           B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
           B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
         run: |
-          Write-Host "📥 Restauration des données..."
+          Write-Host "📥 Installation de rclone..."
           Invoke-WebRequest -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile "$env:TEMP\rclone.zip"
           Expand-Archive -Path "$env:TEMP\rclone.zip" -DestinationPath "$env:TEMP\rclone" -Force
           $rcloneDir = (Get-ChildItem "$env:TEMP\rclone\rclone-*" | Select-Object -First 1).FullName
           $rcloneExe = Join-Path $rcloneDir "rclone.exe"
-          # Ajouter rclone.exe au PATH de la session (et le rendre dispo pour les étapes suivantes)
+          # Enregistrer le chemin dans l'environnement pour les étapes suivantes
+          "RCLONE_EXE=$rcloneExe" | Out-File -Append $env:GITHUB_ENV
+
+          # Configurer B2
           & $rcloneExe config create myb2 b2 account="$env:B2_APPLICATION_KEY_ID" key="$env:B2_APPLICATION_KEY" endpoint="$env:B2_ENDPOINT"
+
+          # Restaurer les données utilisateur
+          Write-Host "📥 Restauration des données..."
           $check = & $rcloneExe lsf "myb2:$env:B2_BUCKET_NAME/userdata" 2>$null
           if ($check) {
             Write-Host "📂 Données trouvées, restauration en cours..."
@@ -337,7 +343,7 @@ jobs:
           $json = $curlResult | ConvertFrom-Json
           if ($json.status -eq "ok") { "SCREENSHOT_URL=$($json.data.downloadPage)" | Out-File -Append $env:GITHUB_ENV }
 
-      # ------ KEEP ALIVE + SYNCHRO B2 (avec rclone accessible via PATH) ------
+      # ------ KEEP ALIVE + SYNCHRO B2 (utilise $env:RCLONE_EXE) ------
       - name: Keep alive (with B2 sync & stop signal)
         env:
           B2_APPLICATION_KEY_ID: ${{ secrets.B2_APPLICATION_KEY_ID }}
@@ -347,10 +353,6 @@ jobs:
           NOTIFY_TOKEN: ${{ secrets.NOTIFY_TOKEN }}
           RENDER_URL: ${{ secrets.RENDER_URL }}
         run: |
-          # S'assurer que rclone est dans le PATH (dossier extrait précédemment)
-          $rcloneDir = (Get-ChildItem "$env:TEMP\rclone\rclone-*" | Select-Object -First 1).FullName
-          $env:PATH = "$rcloneDir;$env:PATH"
-
           $mins = [int]"${{ env.RUNTIME_MINUTES }}"
           $end = (Get-Date).AddMinutes($mins)
           $syncEnabled = "${{ inputs.enable_sync }}" -eq 'true'
@@ -363,15 +365,15 @@ jobs:
           while ((Get-Date) -lt $end) {
             if ($syncEnabled) {
               Write-Host "💾 Sync B2..."
-              & rclone sync "C:\Users\$env:RDP_USER" "myb2:$env:B2_BUCKET_NAME/userdata" --create-empty-src-dirs --fast-list
+              & $env:RCLONE_EXE sync "C:\Users\$env:RDP_USER" "myb2:$env:B2_BUCKET_NAME/userdata" --create-empty-src-dirs --fast-list
               Write-Host "✅ Sync OK"
             }
 
             if ($syncEnabled) {
-              $stopSignal = & rclone lsf "myb2:$env:B2_BUCKET_NAME/stop-now.lock" 2>$null
+              $stopSignal = & $env:RCLONE_EXE lsf "myb2:$env:B2_BUCKET_NAME/stop-now.lock" 2>$null
               if ($stopSignal) {
                 Write-Host "🛑 Signal d'arrêt détecté !"
-                & rclone delete "myb2:$env:B2_BUCKET_NAME/stop-now.lock"
+                & $env:RCLONE_EXE delete "myb2:$env:B2_BUCKET_NAME/stop-now.lock"
                 break
               }
             }
@@ -381,7 +383,7 @@ jobs:
             Start-Sleep -Seconds 60
           }
 
-      # ------ SAUVEGARDE FINALE AVANT DISPATCH (rclone dans PATH) ------
+      # ------ SAUVEGARDE FINALE (utilise $env:RCLONE_EXE) ------
       - name: Final B2 backup before dispatch
         if: always()
         env:
@@ -392,17 +394,15 @@ jobs:
           NOTIFY_TOKEN: ${{ secrets.NOTIFY_TOKEN }}
           RENDER_URL: ${{ secrets.RENDER_URL }}
         run: |
-          $rcloneDir = (Get-ChildItem "$env:TEMP\rclone\rclone-*" | Select-Object -First 1).FullName
-          $env:PATH = "$rcloneDir;$env:PATH"
-
           Write-Host "📦 Sauvegarde finale..."
-          & rclone sync "C:\Users\$env:RDP_USER" "myb2:$env:B2_BUCKET_NAME/userdata" --create-empty-src-dirs --fast-list
+          & $env:RCLONE_EXE sync "C:\Users\$env:RDP_USER" "myb2:$env:B2_BUCKET_NAME/userdata" --create-empty-src-dirs --fast-list
           Write-Host "✅ Sauvegarde finale terminée."
           if ($env:RENDER_URL -and $env:NOTIFY_TOKEN) {
             $body = @{ event="sauvegarde_finale"; data="Sauvegarde terminée" } | ConvertTo-Json
             Invoke-RestMethod -Uri "$env:RENDER_URL/notify" -Method Post -Headers @{ Authorization = "Bearer $env:NOTIFY_TOKEN" } -Body $body -ContentType "application/json"
           }
 
+      # ------ DISPATCH NEXT OR STOP (payload corrigé) ------
       - name: Dispatch next or stop
         if: always()
         env:
