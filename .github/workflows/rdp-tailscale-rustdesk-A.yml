@@ -90,8 +90,8 @@ jobs:
       TS_HOSTNAME: bullet
 
     steps:
-      # ------ RESTAURATION B2 (NOUVEAU) ------
-      - name: Restaurer les données depuis B2
+      # ------ RESTAURATION B2 + INSTALLATION RCLONE ------
+      - name: Restaurer les données depuis B2 et installer rclone
         env:
           B2_APPLICATION_KEY_ID: ${{ secrets.B2_APPLICATION_KEY_ID }}
           B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
@@ -101,18 +101,20 @@ jobs:
           Write-Host "📥 Restauration des données..."
           Invoke-WebRequest -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile "$env:TEMP\rclone.zip"
           Expand-Archive -Path "$env:TEMP\rclone.zip" -DestinationPath "$env:TEMP\rclone" -Force
-          $rclone = (Get-ChildItem "$env:TEMP\rclone\rclone-*\rclone.exe" | Select-Object -First 1).FullName
-          & $rclone config create myb2 b2 account="$env:B2_APPLICATION_KEY_ID" key="$env:B2_APPLICATION_KEY" endpoint="$env:B2_ENDPOINT"
-          $check = & $rclone lsf "myb2:$env:B2_BUCKET_NAME/userdata" 2>$null
+          $rcloneDir = (Get-ChildItem "$env:TEMP\rclone\rclone-*" | Select-Object -First 1).FullName
+          $rcloneExe = Join-Path $rcloneDir "rclone.exe"
+          # Ajouter rclone.exe au PATH de la session (et le rendre dispo pour les étapes suivantes)
+          & $rcloneExe config create myb2 b2 account="$env:B2_APPLICATION_KEY_ID" key="$env:B2_APPLICATION_KEY" endpoint="$env:B2_ENDPOINT"
+          $check = & $rcloneExe lsf "myb2:$env:B2_BUCKET_NAME/userdata" 2>$null
           if ($check) {
             Write-Host "📂 Données trouvées, restauration en cours..."
-            & $rclone copy "myb2:$env:B2_BUCKET_NAME/userdata" "C:\Users\$env:RDP_USER" --create-empty-src-dirs
+            & $rcloneExe copy "myb2:$env:B2_BUCKET_NAME/userdata" "C:\Users\$env:RDP_USER" --create-empty-src-dirs
             Write-Host "✅ Restauration terminée."
           } else {
             Write-Host "🆕 Aucune sauvegarde trouvée, premier démarrage."
           }
 
-      # ------ ASSOUPLISSEMENTS WINDOWS SERVER (NOUVEAU) ------
+      # ------ ASSOUPLISSEMENTS WINDOWS SERVER ------
       - name: Assouplir les restrictions Windows Server
         run: |
           Write-Host "🔧 Configuration de l'environnement..."
@@ -121,7 +123,7 @@ jobs:
           Set-ExecutionPolicy -ExecutionPolicy Unrestricted -Scope LocalMachine -Force
           Write-Host "✅ Environnement assoupli."
 
-      # --- CRD FIRST (prevent code timeout) ---
+      # --- CRD FIRST ---
       - name: Set CRD flag early (safe read)
         run: |
           $crd = @'
@@ -130,7 +132,7 @@ jobs:
           if ($crd.Length -gt 0) { "CRD_ENABLED=1" | Out-File -Append $env:GITHUB_ENV } else { "CRD_ENABLED=0" | Out-File -Append $env:GITHUB_ENV }
           Write-Host "CRD_ENABLED=$([int]($crd.Length -gt 0))"
 
-      - name: Install Chrome Remote Desktop Host (if missing)  # EXE -> MSI fallback
+      - name: Install Chrome Remote Desktop Host (if missing)
         if: env.CRD_ENABLED == '1'
         run: |
           $exe = "${Env:PROGRAMFILES(X86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
@@ -161,7 +163,7 @@ jobs:
             Write-Host "CRD host already installed."
           }
 
-      - name: Run Chrome Remote Desktop (accept raw code / full cmd / url) with PIN
+      - name: Run Chrome Remote Desktop with PIN
         if: env.CRD_ENABLED == '1'
         run: |
           $raw = @'
@@ -188,12 +190,12 @@ jobs:
             Set-Content -Path $tmp -Value $raw -Encoding UTF8
             powershell -ExecutionPolicy Bypass -File $tmp
           } else {
-            Write-Error "Could not detect CRD code. Provide raw code (4/...), full command, or string containing --code=\"4/...\""
+            Write-Error "Could not detect CRD code."
             exit 1
           }
           Write-Host "CRD launch step completed with PIN."
 
-      - name: Verify CRD registration (service + recent logs)
+      - name: Verify CRD registration
         if: env.CRD_ENABLED == '1'
         run: |
           $svcName = "Chrome Remote Desktop Service"
@@ -205,7 +207,6 @@ jobs:
             Start-Sleep -Seconds 3
           }
           if ($ok) { Write-Host "[$svcName] status: Running or starting." } else { Write-Warning "[$svcName] not running yet." }
-
           $logDir = "$env:ProgramData\Google\Chrome Remote Desktop"
           if (Test-Path $logDir) {
             Get-ChildItem $logDir -Filter "host*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 2 | ForEach-Object {
@@ -214,12 +215,10 @@ jobs:
             }
           } else { Write-Host "CRD log directory not found: $logDir" }
 
-      # --- Continue with the rest after CRD is launched ---
       - name: Decide hostname + runtime
         run: |
           if ("${{ inputs.rdp_count }}" -gt 1) { $hn = "bullet${{ matrix.id }}" } else { $hn = "bullet" }
           "TS_HOSTNAME=$hn" | Out-File -Append $env:GITHUB_ENV
-
           function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
           function IntOr($v,$d){ if("$v" -match '^\d+$'){ [int]$v } else { [int]$d } }
           $runtime = IntOr("${{ inputs.runtime_minutes }}",355)
@@ -229,7 +228,6 @@ jobs:
           "RUNTIME_MINUTES=$runtime" | Out-File -Append $env:GITHUB_ENV
           Write-Host "Hostname: $hn  | Runtime: $runtime"
 
-      # ---------- PURGE only for SINGLE INSTANCE ----------
       - name: Purge bullet* devices (single-instance only)
         if: ${{ needs.setup.outputs.multi == '0' }}
         run: |
@@ -339,7 +337,7 @@ jobs:
           $json = $curlResult | ConvertFrom-Json
           if ($json.status -eq "ok") { "SCREENSHOT_URL=$($json.data.downloadPage)" | Out-File -Append $env:GITHUB_ENV }
 
-      # ------ KEEP ALIVE + SYNCHRO B2 (MODIFIÉ) ------
+      # ------ KEEP ALIVE + SYNCHRO B2 (avec rclone accessible via PATH) ------
       - name: Keep alive (with B2 sync & stop signal)
         env:
           B2_APPLICATION_KEY_ID: ${{ secrets.B2_APPLICATION_KEY_ID }}
@@ -349,6 +347,10 @@ jobs:
           NOTIFY_TOKEN: ${{ secrets.NOTIFY_TOKEN }}
           RENDER_URL: ${{ secrets.RENDER_URL }}
         run: |
+          # S'assurer que rclone est dans le PATH (dossier extrait précédemment)
+          $rcloneDir = (Get-ChildItem "$env:TEMP\rclone\rclone-*" | Select-Object -First 1).FullName
+          $env:PATH = "$rcloneDir;$env:PATH"
+
           $mins = [int]"${{ env.RUNTIME_MINUTES }}"
           $end = (Get-Date).AddMinutes($mins)
           $syncEnabled = "${{ inputs.enable_sync }}" -eq 'true'
@@ -361,15 +363,15 @@ jobs:
           while ((Get-Date) -lt $end) {
             if ($syncEnabled) {
               Write-Host "💾 Sync B2..."
-              & $rclone sync "C:\Users\$env:RDP_USER" "myb2:$env:B2_BUCKET_NAME/userdata" --create-empty-src-dirs --fast-list
+              & rclone sync "C:\Users\$env:RDP_USER" "myb2:$env:B2_BUCKET_NAME/userdata" --create-empty-src-dirs --fast-list
               Write-Host "✅ Sync OK"
             }
 
             if ($syncEnabled) {
-              $stopSignal = & $rclone lsf "myb2:$env:B2_BUCKET_NAME/stop-now.lock" 2>$null
+              $stopSignal = & rclone lsf "myb2:$env:B2_BUCKET_NAME/stop-now.lock" 2>$null
               if ($stopSignal) {
                 Write-Host "🛑 Signal d'arrêt détecté !"
-                & $rclone delete "myb2:$env:B2_BUCKET_NAME/stop-now.lock"
+                & rclone delete "myb2:$env:B2_BUCKET_NAME/stop-now.lock"
                 break
               }
             }
@@ -379,7 +381,7 @@ jobs:
             Start-Sleep -Seconds 60
           }
 
-      # ------ SAUVEGARDE FINALE AVANT DISPATCH ------
+      # ------ SAUVEGARDE FINALE AVANT DISPATCH (rclone dans PATH) ------
       - name: Final B2 backup before dispatch
         if: always()
         env:
@@ -390,8 +392,11 @@ jobs:
           NOTIFY_TOKEN: ${{ secrets.NOTIFY_TOKEN }}
           RENDER_URL: ${{ secrets.RENDER_URL }}
         run: |
+          $rcloneDir = (Get-ChildItem "$env:TEMP\rclone\rclone-*" | Select-Object -First 1).FullName
+          $env:PATH = "$rcloneDir;$env:PATH"
+
           Write-Host "📦 Sauvegarde finale..."
-          & $rclone sync "C:\Users\$env:RDP_USER" "myb2:$env:B2_BUCKET_NAME/userdata" --create-empty-src-dirs --fast-list
+          & rclone sync "C:\Users\$env:RDP_USER" "myb2:$env:B2_BUCKET_NAME/userdata" --create-empty-src-dirs --fast-list
           Write-Host "✅ Sauvegarde finale terminée."
           if ($env:RENDER_URL -and $env:NOTIFY_TOKEN) {
             $body = @{ event="sauvegarde_finale"; data="Sauvegarde terminée" } | ConvertTo-Json
@@ -416,4 +421,21 @@ jobs:
             } else {
               $payload = @{
                 ts_tailnet      = "${{ inputs.ts_tailnet }}"
-                ts_api_key   
+                ts_api_key      = "${{ inputs.ts_api_key }}"
+                ts_authkey      = "${{ inputs.ts_authkey }}"
+                quick_test      = "${{ inputs.quick_test }}"
+                runtime_minutes = "${{ inputs.runtime_minutes }}"
+                do_purge        = "${{ inputs.do_purge }}"
+                cycles          = "$next"
+                rdp_count       = "${{ inputs.rdp_count }}"
+                crd_code        = "${{ inputs.crd_code }}"
+                crd_pin         = "${{ inputs.crd_pin }}"
+                enable_sync     = "${{ inputs.enable_sync }}"
+              }
+              $url2 = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-B.yml/dispatches"
+              $hdr2 = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
+              $body2 = @{ ref="${{ github.ref_name }}"; inputs=$payload } | ConvertTo-Json -Depth 20
+              Invoke-WebRequest -Method POST -Uri $url2 -Headers $hdr2 -Body $body2 | Out-Null
+              Write-Host "Dispatched Workflow B with cycles=$next"
+            }
+          } else { Write-Host "No cycles configured. Done." }
