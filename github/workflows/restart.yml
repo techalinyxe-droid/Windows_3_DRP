@@ -1,0 +1,144 @@
+name: 🔄 Restart rapide – RDP + Tailscale + Sync B2
+
+on:
+  workflow_dispatch:
+    inputs:
+      ts_tailnet:        { description: "Tailscale tailnet", required: true }
+      ts_api_key:        { description: "Tailscale API key", required: true }
+      ts_authkey:        { description: "Tailscale Auth key", required: true }
+      runtime_minutes:   { description: "Durée (max 355)", required: false, default: "355" }
+      session_id:        { description: "ID session", required: false, default: "restart" }
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 370
+    env:
+      RDP_USER: Bullettemporary
+      RDP_PASS: ${{ secrets.RDP_PASSWORD }}
+      TS_HOSTNAME: bullet
+
+    steps:
+      # ------ Restauration B2 ------
+      - name: Restaurer les données depuis B2
+        env:
+          B2_APPLICATION_KEY_ID: ${{ secrets.B2_APPLICATION_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
+          B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
+        run: |
+          Write-Host "📥 Restauration..."
+          Invoke-WebRequest -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile "$env:TEMP\rclone.zip"
+          Expand-Archive -Path "$env:TEMP\rclone.zip" -DestinationPath "$env:TEMP\rclone" -Force
+          $rclone = (Get-ChildItem "$env:TEMP\rclone\rclone-*\rclone.exe" | Select-Object -First 1).FullName
+          & $rclone config create myb2 b2 account="$env:B2_APPLICATION_KEY_ID" key="$env:B2_APPLICATION_KEY" endpoint="$env:B2_ENDPOINT"
+          $check = & $rclone lsf "myb2:$env:B2_BUCKET_NAME/userdata" 2>$null
+          if ($check) {
+            & $rclone copy "myb2:$env:B2_BUCKET_NAME/userdata" "C:\Users\$env:RDP_USER" --create-empty-src-dirs
+            Write-Host "✅ Restauration terminée."
+          } else {
+            Write-Host "🆕 Première session."
+          }
+
+      # ------ Purge + Tailscale ------
+      - name: Purger et connecter Tailscale
+        run: |
+          $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${{ inputs.ts_api_key }}:"))
+          $tn = [uri]::EscapeDataString("${{ inputs.ts_tailnet }}")
+          $list = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Headers @{ Authorization = "Basic $auth" }
+          foreach($d in $list.devices){
+            if ($d.hostname -match '^bullet$'){
+              Invoke-RestMethod -Method Delete -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers @{ Authorization = "Basic $auth" } -ErrorAction SilentlyContinue
+            }
+          }
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $ts)) {
+            $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+            $dst = "$env:TEMP\tailscale.msi"
+            Invoke-WebRequest -Uri $url -OutFile $dst
+            Start-Process msiexec.exe -ArgumentList "/i","`"$dst`"","/quiet","/norestart" -Wait
+            Remove-Item $dst -Force
+          }
+          & $ts logout 2>$null
+          & $ts up --authkey "${{ inputs.ts_authkey }}" --hostname "$env:TS_HOSTNAME" --accept-dns=true --accept-routes=true
+          $ip4 = & $ts ip -4 | Select-Object -First 1
+          "TAILSCALE_IP=$ip4" | Out-File -Append $env:GITHUB_ENV
+          Write-Host "✅ Tailscale : $ip4"
+
+      # ------ RDP ------
+      - name: Activer RDP
+        run: |
+          $u=$env:RDP_USER; $p=$env:RDP_PASS
+          $sec = ConvertTo-SecureString $p -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Add-LocalGroupMember -Group "Administrators" -Member $u
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+          } else {
+            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Enable-LocalUser -Name $u
+            Add-LocalGroupMember -Group "Administrators" -Member $u -ErrorAction SilentlyContinue
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u -ErrorAction SilentlyContinue
+          }
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+          Write-Host "✅ RDP activé."
+
+      # ------ Keep-alive + Sync B2 ------
+      - name: Keep alive + sync B2
+        env:
+          B2_APPLICATION_KEY_ID: ${{ secrets.B2_APPLICATION_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
+          B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
+          NOTIFY_TOKEN: ${{ secrets.NOTIFY_TOKEN }}
+          RENDER_URL: ${{ secrets.RENDER_URL }}
+        run: |
+          $runtime = [int]"${{ inputs.runtime_minutes }}"
+          $endTime = (Get-Date).AddMinutes($runtime)
+
+          if ($env:RENDER_URL -and $env:NOTIFY_TOKEN) {
+            $body = @{ event="restart_pret"; data="IP: $env:TAILSCALE_IP" } | ConvertTo-Json
+            Invoke-RestMethod -Uri "$env:RENDER_URL/notify" -Method Post -Headers @{ Authorization = "Bearer $env:NOTIFY_TOKEN" } -Body $body -ContentType "application/json"
+          }
+
+          while ((Get-Date) -lt $endTime) {
+            Write-Host "💾 Sync B2..."
+            & $rclone sync "C:\Users\$env:RDP_USER" "myb2:$env:B2_BUCKET_NAME/userdata" --create-empty-src-dirs --fast-list
+            Write-Host "✅ Sync OK"
+
+            $stopSignal = & $rclone lsf "myb2:$env:B2_BUCKET_NAME/stop-now.lock" 2>$null
+            if ($stopSignal) {
+              Write-Host "🛑 Arrêt demandé."
+              & $rclone delete "myb2:$env:B2_BUCKET_NAME/stop-now.lock"
+              break
+            }
+
+            Start-Sleep -Seconds 300
+          }
+
+      # ------ Sauvegarde finale ------
+      - name: Sauvegarde finale
+        if: always()
+        env:
+          B2_APPLICATION_KEY_ID: ${{ secrets.B2_APPLICATION_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
+          B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
+          NOTIFY_TOKEN: ${{ secrets.NOTIFY_TOKEN }}
+          RENDER_URL: ${{ secrets.RENDER_URL }}
+        run: |
+          & $rclone sync "C:\Users\$env:RDP_USER" "myb2:$env:B2_BUCKET_NAME/userdata" --create-empty-src-dirs --fast-list
+          Write-Host "✅ Sauvegarde finale terminée."
+          if ($env:RENDER_URL -and $env:NOTIFY_TOKEN) {
+            $body = @{ event="sauvegarde_finale"; data="Redémarrage terminé" } | ConvertTo-Json
+            Invoke-RestMethod -Uri "$env:RENDER_URL/notify" -Method Post -Headers @{ Authorization = "Bearer $env:NOTIFY_TOKEN" } -Body $body -ContentType "application/json"
+          }
