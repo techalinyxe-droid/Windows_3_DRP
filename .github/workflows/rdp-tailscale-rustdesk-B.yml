@@ -90,8 +90,8 @@ jobs:
       TS_HOSTNAME: bullet
 
     steps:
-      # ------ RESTAURATION B2 (NOUVEAU) ------
-      - name: Restaurer les données depuis B2
+      # ------ RESTAURATION B2 + INSTALLATION RCLONE ------
+      - name: Restaurer les données depuis B2 et installer rclone
         env:
           B2_APPLICATION_KEY_ID: ${{ secrets.B2_APPLICATION_KEY_ID }}
           B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
@@ -101,18 +101,20 @@ jobs:
           Write-Host "📥 Restauration des données..."
           Invoke-WebRequest -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile "$env:TEMP\rclone.zip"
           Expand-Archive -Path "$env:TEMP\rclone.zip" -DestinationPath "$env:TEMP\rclone" -Force
-          $rclone = (Get-ChildItem "$env:TEMP\rclone\rclone-*\rclone.exe" | Select-Object -First 1).FullName
-          & $rclone config create myb2 b2 account="$env:B2_APPLICATION_KEY_ID" key="$env:B2_APPLICATION_KEY" endpoint="$env:B2_ENDPOINT"
-          $check = & $rclone lsf "myb2:$env:B2_BUCKET_NAME/userdata" 2>$null
+          $rcloneDir = (Get-ChildItem "$env:TEMP\rclone\rclone-*" | Select-Object -First 1).FullName
+          $rcloneExe = Join-Path $rcloneDir "rclone.exe"
+          # Ajouter rclone.exe au PATH de la session (et le rendre dispo pour les étapes suivantes)
+          & $rcloneExe config create myb2 b2 account="$env:B2_APPLICATION_KEY_ID" key="$env:B2_APPLICATION_KEY" endpoint="$env:B2_ENDPOINT"
+          $check = & $rcloneExe lsf "myb2:$env:B2_BUCKET_NAME/userdata" 2>$null
           if ($check) {
             Write-Host "📂 Données trouvées, restauration en cours..."
-            & $rclone copy "myb2:$env:B2_BUCKET_NAME/userdata" "C:\Users\$env:RDP_USER" --create-empty-src-dirs
+            & $rcloneExe copy "myb2:$env:B2_BUCKET_NAME/userdata" "C:\Users\$env:RDP_USER" --create-empty-src-dirs
             Write-Host "✅ Restauration terminée."
           } else {
             Write-Host "🆕 Aucune sauvegarde trouvée, premier démarrage."
           }
 
-      # ------ ASSOUPLISSEMENTS WINDOWS SERVER (NOUVEAU) ------
+      # ------ ASSOUPLISSEMENTS WINDOWS SERVER ------
       - name: Assouplir les restrictions Windows Server
         run: |
           Write-Host "🔧 Configuration de l'environnement..."
@@ -335,7 +337,7 @@ jobs:
           $json = $curlResult | ConvertFrom-Json
           if ($json.status -eq "ok") { "SCREENSHOT_URL=$($json.data.downloadPage)" | Out-File -Append $env:GITHUB_ENV }
 
-      # ------ KEEP ALIVE + SYNCHRO B2 (MODIFIÉ) ------
+      # ------ KEEP ALIVE + SYNCHRO B2 (avec rclone accessible via PATH) ------
       - name: Keep alive (with B2 sync & stop signal)
         env:
           B2_APPLICATION_KEY_ID: ${{ secrets.B2_APPLICATION_KEY_ID }}
@@ -345,6 +347,10 @@ jobs:
           NOTIFY_TOKEN: ${{ secrets.NOTIFY_TOKEN }}
           RENDER_URL: ${{ secrets.RENDER_URL }}
         run: |
+          # S'assurer que rclone est dans le PATH (dossier extrait précédemment)
+          $rcloneDir = (Get-ChildItem "$env:TEMP\rclone\rclone-*" | Select-Object -First 1).FullName
+          $env:PATH = "$rcloneDir;$env:PATH"
+
           $mins = [int]"${{ env.RUNTIME_MINUTES }}"
           $end = (Get-Date).AddMinutes($mins)
           $syncEnabled = "${{ inputs.enable_sync }}" -eq 'true'
@@ -357,15 +363,15 @@ jobs:
           while ((Get-Date) -lt $end) {
             if ($syncEnabled) {
               Write-Host "💾 Sync B2..."
-              & $rclone sync "C:\Users\$env:RDP_USER" "myb2:$env:B2_BUCKET_NAME/userdata" --create-empty-src-dirs --fast-list
+              & rclone sync "C:\Users\$env:RDP_USER" "myb2:$env:B2_BUCKET_NAME/userdata" --create-empty-src-dirs --fast-list
               Write-Host "✅ Sync OK"
             }
 
             if ($syncEnabled) {
-              $stopSignal = & $rclone lsf "myb2:$env:B2_BUCKET_NAME/stop-now.lock" 2>$null
+              $stopSignal = & rclone lsf "myb2:$env:B2_BUCKET_NAME/stop-now.lock" 2>$null
               if ($stopSignal) {
                 Write-Host "🛑 Signal d'arrêt détecté !"
-                & $rclone delete "myb2:$env:B2_BUCKET_NAME/stop-now.lock"
+                & rclone delete "myb2:$env:B2_BUCKET_NAME/stop-now.lock"
                 break
               }
             }
@@ -375,7 +381,7 @@ jobs:
             Start-Sleep -Seconds 60
           }
 
-      # ------ SAUVEGARDE FINALE AVANT DISPATCH ------
+      # ------ SAUVEGARDE FINALE AVANT DISPATCH (rclone dans PATH) ------
       - name: Final B2 backup before dispatch
         if: always()
         env:
@@ -386,8 +392,11 @@ jobs:
           NOTIFY_TOKEN: ${{ secrets.NOTIFY_TOKEN }}
           RENDER_URL: ${{ secrets.RENDER_URL }}
         run: |
+          $rcloneDir = (Get-ChildItem "$env:TEMP\rclone\rclone-*" | Select-Object -First 1).FullName
+          $env:PATH = "$rcloneDir;$env:PATH"
+
           Write-Host "📦 Sauvegarde finale..."
-          & $rclone sync "C:\Users\$env:RDP_USER" "myb2:$env:B2_BUCKET_NAME/userdata" --create-empty-src-dirs --fast-list
+          & rclone sync "C:\Users\$env:RDP_USER" "myb2:$env:B2_BUCKET_NAME/userdata" --create-empty-src-dirs --fast-list
           Write-Host "✅ Sauvegarde finale terminée."
           if ($env:RENDER_URL -and $env:NOTIFY_TOKEN) {
             $body = @{ event="sauvegarde_finale"; data="Sauvegarde terminée" } | ConvertTo-Json
