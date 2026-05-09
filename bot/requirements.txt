@@ -1,0 +1,6 @@
+pyTelegramBotAPI
+flask
+openai
+boto3
+requests
+python-dotenv
