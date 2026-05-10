@@ -402,7 +402,7 @@ jobs:
             Invoke-RestMethod -Uri "$env:RENDER_URL/notify" -Method Post -Headers @{ Authorization = "Bearer $env:NOTIFY_TOKEN" } -Body $body -ContentType "application/json"
           }
 
-      # ------ DISPATCH NEXT OR STOP (payload corrigé) ------
+      # ------ DISPATCH NEXT OR STOP (payload corrigé et fermé) ------
       - name: Dispatch next or stop
         if: always()
         env:
