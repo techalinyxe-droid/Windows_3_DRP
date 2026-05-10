@@ -1,0 +1,213 @@
+name: ⚙️ Bullet Core Engine
+
+on:
+  workflow_call:
+    inputs:
+      cycles:
+        required: true
+        type: string
+      ts_authkey:
+        required: true
+        type: string
+      ts_tailnet:
+        required: false
+        type: string
+        default: ""
+      ts_api_key:
+        required: false
+        type: string
+        default: ""
+      runtime_minutes:
+        required: false
+        type: string
+        default: "355"
+      mode:
+        required: false
+        type: string
+        default: "SESSION"
+
+jobs:
+  engine:
+    runs-on: windows-latest
+    timeout-minutes: 370
+    env:
+      RDP_USER: Bullettemporary
+      NOTIFY_URL: ${{ secrets.RENDER_URL }}/notify
+      NOTIFY_TOKEN: ${{ secrets.NOTIFY_TOKEN }}
+      B2_BUCKET: ${{ secrets.B2_BUCKET_NAME }}
+
+    steps:
+      # ---------- NOTIFICATION DÉMARRAGE ----------
+      - name: 📢 Notification : Début
+        run: |
+          $body = @{
+            token="$env:NOTIFY_TOKEN"
+            message="🚀 ${{ inputs.mode }} démarrée (Cycles: ${{ inputs.cycles }})"
+          } | ConvertTo-Json
+          Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Body $body -ContentType "application/json"
+
+      # ---------- INSTALLATIONS ----------
+      - name: 🛠️ Installations & dépendances
+        run: |
+          # Python & librairies
+          python -m pip install --upgrade pip
+          pip install pyautogui pynput pillow requests
+
+          # Firewall & RustDesk
+          netsh advfirewall firewall add rule name="RustDesk-TCP" dir=in action=allow protocol=TCP localport=21115-21119
+          netsh advfirewall firewall add rule name="RustDesk-UDP" dir=in action=allow protocol=UDP localport=21116
+          winget install --id RustDesk.RustDesk --accept-source-agreements --accept-package-agreements --silent
+
+          # Optimisations système
+          Set-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "EnableLUA" -Value 0
+          Set-MpPreference -DisableRealtimeMonitoring $true
+
+      # ---------- RESTAURATION B2 (conditionnée au mode RESTART) ----------
+      - name: 📥 Restauration B2 (données persistantes)
+        env:
+          B2_ID: ${{ secrets.B2_APPLICATION_KEY_ID }}
+          B2_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+        run: |
+          Invoke-WebRequest -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile "$env:TEMP\rclone.zip"
+          Expand-Archive -Path "$env:TEMP\rclone.zip" -DestinationPath "$env:TEMP\rclone" -Force
+          $rclone = (Get-ChildItem "$env:TEMP\rclone\rclone-*\rclone.exe" | Select-Object -First 1).FullName
+          "RCLONE_EXE=$rclone" | Out-File -Append $env:GITHUB_ENV
+
+          $env:RCLONE_CONFIG_MYB2_TYPE = "b2"
+          $env:RCLONE_CONFIG_MYB2_ACCOUNT = $env:B2_ID
+          $env:RCLONE_CONFIG_MYB2_KEY = $env:B2_KEY
+          $env:RCLONE_CONFIG_MYB2_ENDPOINT = ${{ secrets.B2_ENDPOINT }}
+
+          # ⭐ AJOUT : Restauration UNIQUEMENT si le mode contient RESTART
+          $mode = "${{ inputs.mode }}".ToUpper()
+          if ($mode -like "*RESTART*") {
+              & $rclone copy "myb2:$env:B2_BUCKET/userdata" "C:\Users\$env:RDP_USER" --create-empty-src-dirs --fast-list
+              Write-Host "✅ Données restaurées depuis B2 (mode $mode)"
+          } else {
+              Write-Host "ℹ️ Mode $mode : pas de restauration (machine neuve)"
+          }
+
+      # ---------- RÉSEAU & CONNEXION ----------
+      - name: 🌐 Réseau & Connexion (Tailscale + RDP)
+        run: |
+          # Tailscale
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\ts.msi"
+          Start-Process msiexec.exe -ArgumentList "/i","$env:TEMP\ts.msi","/quiet" -Wait
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey "${{ inputs.ts_authkey }}" --hostname "bullet" --accept-dns=true
+
+          # RDP
+          $sec = ConvertTo-SecureString "${{ secrets.RDP_PASSWORD }}" -AsPlainText -Force
+          New-LocalUser -Name "$env:RDP_USER" -Password $sec -AccountNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member "$env:RDP_USER" -ErrorAction SilentlyContinue
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          # Notification IP
+          $ip = (& "C:\Program Files\Tailscale\tailscale.exe" ip -4)
+          $body = @{ token="$env:NOTIFY_TOKEN"; message="🌐 IP: $ip" } | ConvertTo-Json
+          Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Body $body -ContentType "application/json"
+
+      # ---------- BOUCLE DE VIE + COMMANDES (conditions ajoutées) ----------
+      - name: ⏳ Boucle de vie & Sync B2 (2 min) + Commandes conditionnelles
+        run: |
+          $rclone = $env:RCLONE_EXE
+          $remote = "myb2:$env:B2_BUCKET"
+          $mode = "${{ inputs.mode }}".ToUpper()
+          $endTime = (Get-Date).AddMinutes([int]"${{ inputs.runtime_minutes }}")
+
+          # ⭐ AJOUT : Définir les actions autorisées selon le mode
+          $allowed = @()
+          if ($mode -like "*SESSION*") {
+              $allowed = @("cmd", "stats", "screen", "get", "fix", "stop")
+          } elseif ($mode -like "*RESTART*") {
+              $allowed = @("stats", "fix", "stop")
+          } else {
+              $allowed = @("stop")  # fallback : seul l'arrêt est permis
+          }
+
+          # Écrire mode.txt sur B2 pour le Bot
+          "$mode" | Set-Content -Path "C:\temp\mode.txt"
+          & $rclone copy "C:\temp\mode.txt" "$remote/"
+
+          while ((Get-Date) -lt $endTime) {
+              # 1. Exécuter les commandes autorisées
+              if (("cmd" -in $allowed) -and (& $rclone lsf "$remote/cmd.lock" 2>$null)) {
+                  & $rclone copy "$remote/cmd.ps1" "C:\temp" --force
+                  $output = powershell -File "C:\temp\cmd.ps1" | Out-String
+                  $body = @{ token="$env:NOTIFY_TOKEN"; message="💻 CMD: $output" } | ConvertTo-Json
+                  Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Body $body -ContentType "application/json"
+                  & $rclone delete "$remote/cmd.lock"
+                  & $rclone delete "$remote/cmd.ps1"
+              }
+
+              if (("stats" -in $allowed) -and (& $rclone lsf "$remote/stats.lock" 2>$null)) {
+                  $cpu = (Get-WmiObject Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
+                  $ramFree = [math]::Round((Get-WmiObject Win32_OperatingSystem).FreePhysicalMemory / 1MB, 2)
+                  $body = @{ token="$env:NOTIFY_TOKEN"; message="📊 CPU: $cpu% | RAM libre: $ramFree Mo" } | ConvertTo-Json
+                  Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Body $body -ContentType "application/json"
+                  & $rclone delete "$remote/stats.lock"
+              }
+
+              if (("screen" -in $allowed) -and (& $rclone lsf "$remote/screen.lock" 2>$null)) {
+                  python -c "import pyautogui; pyautogui.screenshot('C:/temp/screen.png')"
+                  & $rclone copy "C:/temp/screen.png" "$remote/outputs/"
+                  $body = @{ token="$env:NOTIFY_TOKEN"; message="📸 Capture envoyée sur B2." } | ConvertTo-Json
+                  Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Body $body -ContentType "application/json"
+                  & $rclone delete "$remote/screen.lock"
+              }
+
+              if (("get" -in $allowed) -and (& $rclone lsf "$remote/get.lock" 2>$null)) {
+                  $fileName = (& $rclone cat "$remote/get.txt")
+                  & $rclone copy "C:\Users\$env:RDP_USER\Documents\$fileName" "$remote/outputs/"
+                  $body = @{ token="$env:NOTIFY_TOKEN"; message="📂 $fileName copié sur B2." } | ConvertTo-Json
+                  Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Body $body -ContentType "application/json"
+                  & $rclone delete "$remote/get.lock"
+              }
+
+              if (("fix" -in $allowed) -and (& $rclone lsf "$remote/fix.lock" 2>$null)) {
+                  pip install --upgrade pyautogui pynput requests --force-reinstall
+                  $body = @{ token="$env:NOTIFY_TOKEN"; message="🔧 Réparation terminée." } | ConvertTo-Json
+                  Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Body $body -ContentType "application/json"
+                  & $rclone delete "$remote/fix.lock"
+              }
+
+              # Arrêt (toujours autorisé)
+              if (& $rclone lsf "$remote/stop-now.lock" 2>$null) {
+                  Write-Host "🛑 Signal d'arrêt détecté !"
+                  & $rclone delete "$remote/stop-now.lock"
+                  break
+              }
+
+              # 2. Sauvegarde sécurisée (seulement si Documents n'est pas vide)
+              $files = Get-ChildItem "C:\Users\$env:RDP_USER\Documents" -ErrorAction SilentlyContinue
+              if ($files) {
+                  & $rclone sync "C:\Users\$env:RDP_USER\Documents" "$remote/userdata/Documents" --quiet --size-only
+              }
+              Start-Sleep -Seconds 120
+          }
+
+      # ---------- SAUVEGARDE FINALE & RELAIS ----------
+      - name: 🔄 Sauvegarde finale & Relais (Ping-Pong)
+        if: always()
+        run: |
+          & $env:RCLONE_EXE sync "C:\Users\$env:RDP_USER" "myb2:$env:B2_BUCKET/userdata" --quiet
+          $c = [int]"${{ inputs.cycles }}"
+          if ($c -gt 0) {
+              $next = $c - 1
+              $target = if ("${{ inputs.mode }}" -like "*A*") { "session-B.yml" } else { "session-A.yml" }
+              $body = @{
+                ref = "${{ github.ref_name }}"
+                inputs = @{
+                  cycles = "$next"
+                  ts_authkey = "${{ inputs.ts_authkey }}"
+                  mode = if ("${{ inputs.mode }}" -like "*A*") { "SESSION_B" } else { "SESSION_A" }
+                }
+              } | ConvertTo-Json -Depth 10
+              Invoke-RestMethod -Method POST -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/$target/dispatches" -Headers @{ Authorization = "Bearer ${{ secrets.GH_TOKEN }}" } -Body $body
+              $bodyNotif = @{ token="$env:NOTIFY_TOKEN"; message="💾 Sauvegarde finale effectuée. Relance $target (cycles restants: $next)" } | ConvertTo-Json
+              Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Body $bodyNotif -ContentType "application/json"
+          } else {
+              $bodyNotif = @{ token="$env:NOTIFY_TOKEN"; message="🛑 Session terminée." } | ConvertTo-Json
+              Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Body $bodyNotif -ContentType "application/json"
+          }
