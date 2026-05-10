@@ -2,41 +2,22 @@ name: 🛑 Save & Stop
 
 on:
   workflow_dispatch:
-    inputs:
-      ts_tailnet:  { description: "Tailscale tailnet", required: true }
-      ts_api_key:  { description: "Tailscale API key", required: true }
-      session_id:  { description: "ID session", required: false, default: "stop" }
-
-permissions:
-  contents: read
-
-defaults:
-  run:
-    shell: pwsh
 
 jobs:
   stop:
     runs-on: ubuntu-latest
     steps:
-      - name: Créer le signal d'arrêt dans B2
+      - name: Send Stop Signal to B2
         env:
           B2_APPLICATION_KEY_ID: ${{ secrets.B2_APPLICATION_KEY_ID }}
           B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
           B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
           B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
-          NOTIFY_TOKEN: ${{ secrets.NOTIFY_TOKEN }}
-          RENDER_URL: ${{ secrets.RENDER_URL }}
         run: |
           curl -O https://downloads.rclone.org/rclone-current-linux-amd64.zip
           unzip rclone-current-linux-amd64.zip
-          cd rclone-*-linux-amd64
-          sudo cp rclone /usr/local/bin/
+          sudo cp rclone-*-linux-amd64/rclone /usr/local/bin/
           rclone config create myb2 b2 account="$B2_APPLICATION_KEY_ID" key="$B2_APPLICATION_KEY" endpoint="$B2_ENDPOINT"
           echo "stop" > stop-now.lock
           rclone copy stop-now.lock "myb2:$B2_BUCKET_NAME/"
-          Write-Host "✅ Signal d'arrêt envoyé."
-
-          if ($env:RENDER_URL -and $env:NOTIFY_TOKEN) {
-            $body = @{ event="arret_demande"; data="Stop demandé" } | ConvertTo-Json
-            Invoke-RestMethod -Uri "$env:RENDER_URL/notify" -Method Post -Headers @{ Authorization = "Bearer $env:NOTIFY_TOKEN" } -Body $body -ContentType "application/json"
-          }
+          echo "✅ Signal d'arrêt déposé sur B2."
