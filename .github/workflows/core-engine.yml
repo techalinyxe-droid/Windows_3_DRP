@@ -109,84 +109,19 @@ jobs:
           Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Body $body -ContentType "application/json"
 
       # ---------- BOUCLE DE VIE + COMMANDES (conditions ajoutées) ----------
-      - name: ⏳ Boucle de vie & Sync B2 (2 min) + Commandes conditionnelles
-        run: |
-          $rclone = $env:RCLONE_EXE
-          $remote = "myb2:$env:B2_BUCKET"
-          $mode = "${{ inputs.mode }}".ToUpper()
-          $endTime = (Get-Date).AddMinutes([int]"${{ inputs.runtime_minutes }}")
-
-          # ⭐ AJOUT : Définir les actions autorisées selon le mode
-          $allowed = @()
-          if ($mode -like "*SESSION*") {
-              $allowed = @("cmd", "stats", "screen", "get", "fix", "stop")
-          } elseif ($mode -like "*RESTART*") {
-              $allowed = @("stats", "fix", "stop")
-          } else {
-              $allowed = @("stop")  # fallback : seul l'arrêt est permis
-          }
-
-          # Écrire mode.txt sur B2 pour le Bot
-          "$mode" | Set-Content -Path "C:\temp\mode.txt"
-          & $rclone copy "C:\temp\mode.txt" "$remote/"
-
-          while ((Get-Date) -lt $endTime) {
-              # 1. Exécuter les commandes autorisées
-              if (("cmd" -in $allowed) -and (& $rclone lsf "$remote/cmd.lock" 2>$null)) {
-                  & $rclone copy "$remote/cmd.ps1" "C:\temp" --force
-                  $output = powershell -File "C:\temp\cmd.ps1" | Out-String
-                  $body = @{ token="$env:NOTIFY_TOKEN"; message="💻 CMD: $output" } | ConvertTo-Json
-                  Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Body $body -ContentType "application/json"
-                  & $rclone delete "$remote/cmd.lock"
-                  & $rclone delete "$remote/cmd.ps1"
-              }
-
-              if (("stats" -in $allowed) -and (& $rclone lsf "$remote/stats.lock" 2>$null)) {
-                  $cpu = (Get-WmiObject Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
-                  $ramFree = [math]::Round((Get-WmiObject Win32_OperatingSystem).FreePhysicalMemory / 1MB, 2)
-                  $body = @{ token="$env:NOTIFY_TOKEN"; message="📊 CPU: $cpu% | RAM libre: $ramFree Mo" } | ConvertTo-Json
-                  Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Body $body -ContentType "application/json"
-                  & $rclone delete "$remote/stats.lock"
-              }
-
-              if (("screen" -in $allowed) -and (& $rclone lsf "$remote/screen.lock" 2>$null)) {
-                  python -c "import pyautogui; pyautogui.screenshot('C:/temp/screen.png')"
-                  & $rclone copy "C:/temp/screen.png" "$remote/outputs/"
-                  $body = @{ token="$env:NOTIFY_TOKEN"; message="📸 Capture envoyée sur B2." } | ConvertTo-Json
-                  Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Body $body -ContentType "application/json"
-                  & $rclone delete "$remote/screen.lock"
-              }
-
-              if (("get" -in $allowed) -and (& $rclone lsf "$remote/get.lock" 2>$null)) {
-                  $fileName = (& $rclone cat "$remote/get.txt")
-                  & $rclone copy "C:\Users\$env:RDP_USER\Documents\$fileName" "$remote/outputs/"
-                  $body = @{ token="$env:NOTIFY_TOKEN"; message="📂 $fileName copié sur B2." } | ConvertTo-Json
-                  Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Body $body -ContentType "application/json"
-                  & $rclone delete "$remote/get.lock"
-              }
-
-              if (("fix" -in $allowed) -and (& $rclone lsf "$remote/fix.lock" 2>$null)) {
-                  pip install --upgrade pyautogui pynput requests --force-reinstall
-                  $body = @{ token="$env:NOTIFY_TOKEN"; message="🔧 Réparation terminée." } | ConvertTo-Json
-                  Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Body $body -ContentType "application/json"
-                  & $rclone delete "$remote/fix.lock"
-              }
-
-              # Arrêt (toujours autorisé)
-              if (& $rclone lsf "$remote/stop-now.lock" 2>$null) {
-                  Write-Host "🛑 Signal d'arrêt détecté !"
-                  & $rclone delete "$remote/stop-now.lock"
-                  break
-              }
-
-              # 2. Sauvegarde sécurisée (seulement si Documents n'est pas vide)
-              $files = Get-ChildItem "C:\Users\$env:RDP_USER\Documents" -ErrorAction SilentlyContinue
-              if ($files) {
-                  & $rclone sync "C:\Users\$env:RDP_USER\Documents" "$remote/userdata/Documents" --quiet --size-only
-              }
-              Start-Sleep -Seconds 120
-          }
-
+      - name: 🕹️ Boucle de commandes
+  uses: ./.github/actions/command-dispatcher
+  with:
+    rclone_exe: ${{ env.RCLONE_EXE }}
+    bucket: ${{ secrets.B2_BUCKET_NAME }}
+    b2_application_key_id: ${{ secrets.B2_APPLICATION_KEY_ID }}
+    b2_application_key: ${{ secrets.B2_APPLICATION_KEY }}
+    b2_endpoint: ${{ secrets.B2_ENDPOINT }}
+    notify_url: ${{ secrets.RENDER_URL }}/notify
+    notify_token: ${{ secrets.NOTIFY_TOKEN }}
+    runtime_minutes: ${{ inputs.runtime_minutes }}
+    mode: ${{ inputs.mode }}
+    
       # ---------- SAUVEGARDE FINALE & RELAIS ----------
       - name: 🔄 Sauvegarde finale & Relais (Ping-Pong)
         if: always()
