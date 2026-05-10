@@ -36,7 +36,6 @@ jobs:
       NOTIFY_TOKEN: ${{ secrets.NOTIFY_TOKEN }}
       B2_BUCKET: ${{ secrets.B2_BUCKET_NAME }}
     steps:
-      # ---------- NOTIFICATION DÉMARRAGE ----------
       - name: 📢 Notification : Début
         run: |
           $body = @{
@@ -45,23 +44,16 @@ jobs:
           } | ConvertTo-Json
           Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Body $body -ContentType "application/json"
 
-      # ---------- INSTALLATIONS ----------
       - name: 🛠️ Installations & dépendances
         run: |
-          # Python & librairies
           python -m pip install --upgrade pip
           pip install pyautogui pynput pillow requests
-
-          # Firewall & RustDesk
           netsh advfirewall firewall add rule name="RustDesk-TCP" dir=in action=allow protocol=TCP localport=21115-21119
           netsh advfirewall firewall add rule name="RustDesk-UDP" dir=in action=allow protocol=UDP localport=21116
           winget install --id RustDesk.RustDesk --accept-source-agreements --accept-package-agreements --silent
-
-          # Optimisations système
           Set-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "EnableLUA" -Value 0
           Set-MpPreference -DisableRealtimeMonitoring $true
 
-      # ---------- RESTAURATION B2 (conditionnée au mode RESTART) ----------
       - name: 📥 Restauration B2 (données persistantes)
         env:
           B2_ID: ${{ secrets.B2_APPLICATION_KEY_ID }}
@@ -71,13 +63,10 @@ jobs:
           Expand-Archive -Path "$env:TEMP\rclone.zip" -DestinationPath "$env:TEMP\rclone" -Force
           $rclone = (Get-ChildItem "$env:TEMP\rclone\rclone-*\rclone.exe" | Select-Object -First 1).FullName
           "RCLONE_EXE=$rclone" | Out-File -Append $env:GITHUB_ENV
-
           $env:RCLONE_CONFIG_MYB2_TYPE = "b2"
           $env:RCLONE_CONFIG_MYB2_ACCOUNT = $env:B2_ID
           $env:RCLONE_CONFIG_MYB2_KEY = $env:B2_KEY
           $env:RCLONE_CONFIG_MYB2_ENDPOINT = ${{ secrets.B2_ENDPOINT }}
-
-          # ⭐ AJOUT : Restauration UNIQUEMENT si le mode contient RESTART
           $mode = "${{ inputs.mode }}".ToUpper()
           if ($mode -like "*RESTART*") {
               & $rclone copy "myb2:$env:B2_BUCKET/userdata" "C:\Users\$env:RDP_USER" --create-empty-src-dirs --fast-list
@@ -86,28 +75,21 @@ jobs:
               Write-Host "ℹ️ Mode $mode : pas de restauration (machine neuve)"
           }
 
-      # ---------- RÉSEAU & CONNEXION ----------
       - name: 🌐 Réseau & Connexion (Tailscale + RDP)
         run: |
-          # Tailscale
           $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\ts.msi"
           Start-Process msiexec.exe -ArgumentList "/i","$env:TEMP\ts.msi","/quiet" -Wait
           & "C:\Program Files\Tailscale\tailscale.exe" up --authkey "${{ inputs.ts_authkey }}" --hostname "bullet" --accept-dns=true
-
-          # RDP
           $sec = ConvertTo-SecureString "${{ secrets.RDP_PASSWORD }}" -AsPlainText -Force
           New-LocalUser -Name "$env:RDP_USER" -Password $sec -AccountNeverExpires -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Administrators" -Member "$env:RDP_USER" -ErrorAction SilentlyContinue
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-
-          # Notification IP
           $ip = (& "C:\Program Files\Tailscale\tailscale.exe" ip -4)
           $body = @{ token="$env:NOTIFY_TOKEN"; message="🌐 IP: $ip" } | ConvertTo-Json
           Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Body $body -ContentType "application/json"
 
-      # ---------- BOUCLE DE VIE + COMMANDES (conditions ajoutées) ----------
       - name: 🕹️ Boucle de commandes
         uses: ./.github/actions/command-dispatcher
         with:
@@ -121,7 +103,6 @@ jobs:
           runtime_minutes: ${{ inputs.runtime_minutes }}
           mode: ${{ inputs.mode }}
 
-      # ---------- SAUVEGARDE FINALE & RELAIS ----------
       - name: 🔄 Sauvegarde finale & Relais (Ping-Pong)
         if: always()
         run: |
