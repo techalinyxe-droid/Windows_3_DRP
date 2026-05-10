@@ -1,0 +1,20 @@
+name: 🔵 Bullet Session B
+
+on:
+  workflow_dispatch:
+    inputs:
+      ts_authkey:
+        description: 'Tailscale Auth Key'
+        required: true
+      cycles:
+        description: 'Nombre de cycles'
+        required: true
+
+jobs:
+  run:
+    uses: ./.github/workflows/core-engine.yml
+    with:
+      cycles: ${{ inputs.cycles }}
+      ts_authkey: ${{ inputs.ts_authkey }}
+      mode: "SESSION_B"
+    secrets: inherit
