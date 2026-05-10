@@ -35,7 +35,6 @@ jobs:
       NOTIFY_URL: ${{ secrets.RENDER_URL }}/notify
       NOTIFY_TOKEN: ${{ secrets.NOTIFY_TOKEN }}
       B2_BUCKET: ${{ secrets.B2_BUCKET_NAME }}
-
     steps:
       # ---------- NOTIFICATION DÉMARRAGE ----------
       - name: 📢 Notification : Début
