@@ -38,6 +38,45 @@ B2_ENDPOINT = os.environ.get("B2_ENDPOINT")
 COOLDOWN_MINUTES = 10
 APPS_KEY = "apps.txt"
 
+# Modèles IA disponibles
+AVAILABLE_MODELS = [
+    "deepseek-ai/DeepSeek-V4-Flash:novita",
+    "mistralai/Mixtral-8x7B-Instruct-v0.1",
+    "mistralai/Mistral-7B-Instruct-v0.2",
+    "meta-llama/Meta-Llama-3.1-8B-Instruct",
+    "Qwen/Qwen2.5-7B-Instruct"
+]
+current_model = os.environ.get("HF_MODEL", AVAILABLE_MODELS[0])
+
+# ------------------------------------------------------------------
+# AJOUT : Bibliothèque des 16 scripts maîtres (templates PowerShell)
+# ------------------------------------------------------------------
+SCRIPTS_LIBRARY = {
+    # Analyse
+    "s_anal_disk": "Get-ChildItem -Path 'C:/{arg}' -Recurse -ErrorAction SilentlyContinue | Sort-Object Length -Descending | Select-Object Name, @{{Name='Size(MB)';Expression={{[Math]::Round($_.Length / 1MB, 2)}}}} -First 15",
+    "s_anal_perf": "Get-Process | Sort-Object CPU -Descending | Select-Object -First 10 | Select-Object ProcessName, @{{Name='CPU(%)';Expression={{[Math]::Round($_.CPU, 1)}}}}, @{{Name='RAM(MB)';Expression={{[Math]::Round($_.WorkingSet / 1MB, 1)}}}}",
+    "s_anal_net": "Test-NetConnection -ComputerName 8.8.8.8; Get-NetTCPConnection | Where-Object {{$_.State -eq 'Established'}} | Select-Object LocalAddress, LocalPort, RemoteAddress, RemotePort",
+    "s_anal_ia": "Select-String -Path 'C:/Users/$env:RDP_USER/Desktop/*.log' -Pattern '{arg}' -Context 2,2 | Select-Object -Last 10",
+
+    # Fichiers
+    "s_get_file": "& $env:RCLONE_EXE copy 'C:/Users/$env:RDP_USER/{arg}' 'myb2:$env:B2_BUCKET/outputs/' --progress",
+    "s_dl_b2": "& $env:RCLONE_EXE copy 'myb2:$env:B2_BUCKET/{arg}' 'C:/Users/$env:RDP_USER/Downloads/' --force",
+    "s_zip_folder": "Compress-Archive -Path 'C:/Users/$env:RDP_USER/{arg}' -DestinationPath 'C:/temp/archive.zip' -Force; & $env:RCLONE_EXE move 'C:/temp/archive.zip' 'myb2:$env:B2_BUCKET/outputs/'",
+    "s_search": "Get-ChildItem -Path 'C:/Users/$env:RDP_USER/' -Filter '*{arg}*' -Recurse -ErrorAction SilentlyContinue | Select-Object FullName",
+
+    # Système & Réparation
+    "s_fix_pip": "python -m pip install --upgrade pip; pip install {arg} --force-reinstall",
+    "s_kill_task": "Stop-Process -Name '{arg}' -Force -ErrorAction SilentlyContinue",
+    "s_sys_info": "Get-ComputerInfo | Select-Object OsName, OsVersion, CsProcessors, @{{Name='Uptime';Expression={{(Get-Date) - (Get-Uptime)}}}}",
+    "s_clean_tmp": "Remove-Item -Path 'C:/Users/$env:RDP_USER/AppData/Local/Temp/*' -Recurse -Force; Write-Host 'Nettoyage Temp terminé.'",
+
+    # Automatisation
+    "s_auto_run": "Start-Process python.exe -ArgumentList 'C:/Users/$env:RDP_USER/Desktop/{arg}'",
+    "s_firewall": "netsh advfirewall firewall add rule name='Open_{arg}' dir=in action=allow protocol=TCP localport={arg}",
+    "s_screenshot": "python -c 'import pyautogui; pyautogui.screenshot(\"C:/temp/screen.png\")'; & $env:RCLONE_EXE move 'C:/temp/screen.png' 'myb2:$env:B2_BUCKET/outputs/'",
+    "s_health": "Write-Host '--- DISQUE ---'; Get-PSDrive C | Select-Object Used,Free; Write-Host '--- RAM ---'; Get-WmiObject Win32_OperatingSystem | Select-Object FreePhysicalMemory; Write-Host '--- SERVICES ---'; Get-Service | Where-Object {{$_.Status -eq 'Running'}} | Select-Object -First 5"
+}
+
 # Clients
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
@@ -85,18 +124,24 @@ def trigger_workflow(workflow_id):
     if not ok: return f"⏳ Cooldown actif : attends encore {mins} min."
 
     url_dispatch = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/workflows/{workflow_id}/dispatches"
+    
     inputs = {
-        "session_id": str(int(time.time())),
         "runtime_minutes": "355",
         "ts_tailnet": TS_TAILNET,
         "ts_authkey": TS_AUTHKEY,
         "ts_api_key": TS_API_KEY
     }
+    
     res = requests.post(url_dispatch, headers=headers, json={"ref": "main", "inputs": inputs})
     if res.status_code == 204:
         b2_client.put_object(Bucket=B2_BUCKET_NAME, Key='cooldown.txt', Body='updated')
         return f"🚀 Démarrage réussi de {workflow_id} !"
-    return f"❌ Erreur GitHub : {res.status_code}"
+    
+    try:
+        detail = res.json().get("message", res.text)
+    except:
+        detail = res.text
+    return f"❌ Erreur GitHub {res.status_code} : {detail}"
 
 # ==========================================
 # COMMANDES TELEGRAM (HANDLERS)
@@ -108,16 +153,71 @@ def block_unauthorized(m): bot.reply_to(m, "⛔ Accès refusé.")
 @bot.message_handler(commands=['help'])
 def h_help(m):
     text = ("🤖 **Aide Bullet**\n\n"
+            "*Contrôle Session*\n"
             "/start - Session complète\n"
             "/restart - Redémarrage rapide\n"
             "/stop - Arrêt propre (B2 lock)\n"
-            "/status - État des workflows\n"
+            "/status - État des workflows\n\n"
+            "*Pilotage à distance (Core-Engine)*\n"
+            "/cmd <commande> - Exécute du PowerShell\n"
+            "/stats - CPU/RAM en direct\n"
+            "/get <fichier> - Récupère un fichier\n"
+            "/fix - Répare dépendances Python\n"
+            "/screen - Capture d'écran\n\n"
+            "*Scripts prédéfinis*\n"
+            "/s_list - Liste des scripts\n"
+            "/s_nom_script [arg] - Lancer un script\n\n"
+            "*Stockage & Apps*\n"
             "/files [dossier] - Liste B2\n"
             "/storage - Taille B2\n"
             "/apps - Liste des apps\n"
             "/addapp [nom] - Ajouter une app\n"
-            "/removeapp [nom] - Retirer une app")
+            "/removeapp [nom] - Retirer une app\n\n"
+            "*Modèles IA*\n"
+            "/models - Lister les modèles disponibles\n"
+            "/model [nom/num] - Changer de modèle\n\n"
+            "*Système*\n"
+            "/settings - Configuration et état")
     bot.reply_to(m, text, parse_mode="Markdown")
+
+@bot.message_handler(commands=['models'])
+def h_models(m):
+    models_list = []
+    for i, model_name in enumerate(AVAILABLE_MODELS, 1):
+        prefix = "✅" if model_name == current_model else "  "
+        models_list.append(f"{prefix} {i}. `{model_name}`")
+    
+    msg = "*Modèles disponibles :*\n" + "\n".join(models_list)
+    msg += "\n\n_Utilisez /model <numéro> ou /model <nom> pour changer._"
+    bot.reply_to(m, msg, parse_mode="Markdown")
+
+@bot.message_handler(commands=['model'])
+def h_model(m):
+    global current_model
+    arg = m.text.replace('/model', '').strip()
+    
+    if not arg:
+        h_models(m)
+        return
+    
+    if arg.isdigit():
+        idx = int(arg) - 1
+        if 0 <= idx < len(AVAILABLE_MODELS):
+            current_model = AVAILABLE_MODELS[idx]
+            os.environ["HF_MODEL"] = current_model
+            bot.reply_to(m, f"✅ Modèle changé pour : `{current_model}`", parse_mode="Markdown")
+        else:
+            bot.reply_to(m, f"❌ Numéro invalide. Choisis entre 1 et {len(AVAILABLE_MODELS)}.")
+        return
+    
+    for model_name in AVAILABLE_MODELS:
+        if arg.lower() in model_name.lower():
+            current_model = model_name
+            os.environ["HF_MODEL"] = current_model
+            bot.reply_to(m, f"✅ Modèle changé pour : `{current_model}`", parse_mode="Markdown")
+            return
+            
+    bot.reply_to(m, f"❌ Modèle non trouvé. Utilise /models pour voir la liste.")
 
 @bot.message_handler(commands=['start'])
 def h_start(m): bot.reply_to(m, trigger_workflow('rdp-tailscale-rustdesk-A.yml'))
@@ -172,6 +272,94 @@ def h_removeapp(m):
     b2_client.put_object(Bucket=B2_BUCKET_NAME, Key=APPS_KEY, Body='\n'.join(lines))
     bot.reply_to(m, f"🗑️ Retiré : {app_name}")
 
+# ------------------------------------------------------------------
+# NOUVELLES COMMANDES DE PILOTAGE DU CORE-ENGINE (CMD, STATS, GET, FIX, SCREEN)
+# ------------------------------------------------------------------
+@bot.message_handler(commands=['cmd'])
+def h_cmd(m):
+    ps_command = m.text.replace('/cmd', '').strip()
+    if not ps_command:
+        bot.reply_to(m, "❌ Utilisation : `/cmd [votre commande]`")
+        return
+    b2_client.put_object(Bucket=B2_BUCKET_NAME, Key='cmd.ps1', Body=ps_command)
+    b2_client.put_object(Bucket=B2_BUCKET_NAME, Key='cmd.lock', Body='lock')
+    bot.reply_to(m, f"💻 Commande PowerShell envoyée au serveur.")
+
+@bot.message_handler(commands=['stats'])
+def h_stats(m):
+    b2_client.put_object(Bucket=B2_BUCKET_NAME, Key='stats.lock', Body='lock')
+    bot.reply_to(m, "📊 Demande de stats (CPU/RAM) envoyée.")
+
+@bot.message_handler(commands=['get'])
+def h_get(m):
+    filename = m.text.replace('/get', '').strip()
+    if not filename:
+        bot.reply_to(m, "❌ Utilisation : `/get nom_du_fichier.ext`")
+        return
+    b2_client.put_object(Bucket=B2_BUCKET_NAME, Key='get.txt', Body=filename)
+    b2_client.put_object(Bucket=B2_BUCKET_NAME, Key='get.lock', Body='lock')
+    bot.reply_to(m, f"📂 Ordre de récupération pour `{filename}` envoyé.")
+
+@bot.message_handler(commands=['fix'])
+def h_fix(m):
+    b2_client.put_object(Bucket=B2_BUCKET_NAME, Key='fix.lock', Body='lock')
+    bot.reply_to(m, "🔧 Commande de réparation Python/Pip envoyée.")
+
+@bot.message_handler(commands=['screen'])
+def h_screen(m):
+    b2_client.put_object(Bucket=B2_BUCKET_NAME, Key='screen.lock', Body='lock')
+    bot.reply_to(m, "📸 Capture d'écran demandée.")
+
+# ------------------------------------------------------------------
+# COMMANDES DE SCRIPTS (BIBLIOTHÈQUE /s_...)
+# ------------------------------------------------------------------
+@bot.message_handler(commands=['s_list'])
+def h_s_list(m):
+    scripts = "\n".join([f"• `/{name}`" for name in SCRIPTS_LIBRARY.keys()])
+    bot.reply_to(m, f"📜 **Bibliothèque de Scripts :**\n\n{scripts}\n\n_Usage: /s_nom_du_script [ton_argument]_", parse_mode="Markdown")
+
+@bot.message_handler(func=lambda m: m.text.startswith('/s_'))
+def execute_script_engine(m):
+    parts = m.text.split(' ', 1)
+    cmd_name = parts[0].replace('/', '')
+    argument = parts[1] if len(parts) > 1 else ""
+
+    if cmd_name in SCRIPTS_LIBRARY:
+        # Si le script demande un argument et qu'il est vide
+        if "{arg}" in SCRIPTS_LIBRARY[cmd_name] and not argument:
+            bot.reply_to(m, f"⚠️ Ce script demande un argument.\nExemple : `/{cmd_name} mon_texte_ou_chemin`")
+            return
+
+        # Préparation du PowerShell final
+        ps_code = SCRIPTS_LIBRARY[cmd_name].replace("{arg}", argument)
+        
+        try:
+            b2_client.put_object(Bucket=B2_BUCKET_NAME, Key='cmd.ps1', Body=ps_code)
+            b2_client.put_object(Bucket=B2_BUCKET_NAME, Key='cmd.lock', Body='lock')
+            bot.reply_to(m, f"✅ **Ordre envoyé au Core-Engine**\nScript : `{cmd_name}`\nArg : `{argument}`\n\n_Attends la notification du résultat..._")
+        except Exception as e:
+            bot.reply_to(m, f"❌ Erreur B2 : {e}")
+    else:
+        bot.reply_to(m, "❌ Ce script n'existe pas dans la bibliothèque.")
+
+# ------------------------------------------------------------------
+# COMMANDE /settings (vision globale)
+# ------------------------------------------------------------------
+@bot.message_handler(commands=['settings'])
+def h_settings(m):
+    status_engine = "🟢 Actif" if "in_progress" in get_workflow_status('core-engine.yml') else "🔴 Hors-ligne"
+    text = (
+        "⚙️ **CONFIGURATION BULLET ULTIMA**\n\n"
+        f"🚀 **Statut Core Engine :** {status_engine}\n"
+        f"📂 **Bucket B2 :** `{B2_BUCKET_NAME}`\n"
+        f"⏱️ **Runtime :** `355 min`\n"
+        f"⏳ **Cooldown :** `{COOLDOWN_MINUTES} min`\n\n"
+        "📜 **Scripts de Contrôle Prêts :**\n"
+        "└ _Analyse, Fichiers, Système, Auto_\n\n"
+        "💡 _Utilisez /s_list pour voir toutes les commandes de scripts._"
+    )
+    bot.reply_to(m, text, parse_mode="Markdown")
+
 # ==========================================
 # IA CONVERSATIONNELLE
 # ==========================================
@@ -189,7 +377,7 @@ def handle_ai(message):
 
     try:
         response = llm_client.chat.completions.create(
-            model="deepseek-ai/DeepSeek-V4-Flash:novita",
+            model=current_model,
             messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": message.text}]
         )
         content = response.choices[0].message.content
@@ -203,7 +391,8 @@ def handle_ai(message):
             elif act == "get_status": h_status(message)
             content = content[:match.start()].strip()
         if content: bot.send_message(message.chat.id, content)
-    except: bot.reply_to(message, "L'IA ne répond pas. Utilise les commandes /.")
+    except Exception as e: 
+        bot.reply_to(message, f"L'IA ({current_model}) ne répond pas ou a rencontré une erreur. Utilise les commandes /.")
 
 # ==========================================
 # FLASK (NOTIFY & HEALTH)
@@ -221,8 +410,8 @@ def notify():
     
     try:
         ai_res = llm_client.chat.completions.create(
-            model="deepseek-ai/DeepSeek-V4-Flash:novita",
-            messages=[{"role": "user", "content": f"Reformule gentiment : {event} - {info}"}]
+            model=current_model,
+            messages=[{"role": "user", "content": f"Reformule gentiment en une courte phrase pour Telegram: {event} - {info}"}]
         )
         msg = f"🔔 {ai_res.choices[0].message.content}"
     except: msg = f"🔔 {event}: {info}"
