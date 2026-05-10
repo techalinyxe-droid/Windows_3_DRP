@@ -1,0 +1,127 @@
+name: 'Bullet Command Dispatcher'
+description: 'Lit les fichiers .lock sur B2 et exécute les commandes (CMD, stats, screen, get, fix, stop) selon le mode'
+
+inputs:
+  rclone_exe:
+    description: 'Chemin complet vers rclone.exe'
+    required: true
+  bucket:
+    description: 'Nom du bucket B2'
+    required: true
+  b2_application_key_id:
+    description: 'B2 Key ID'
+    required: true
+  b2_application_key:
+    description: 'B2 Application Key'
+    required: true
+  b2_endpoint:
+    description: 'B2 Endpoint (ex: s3.eu-central-003.backblazeb2.com)'
+    required: true
+  notify_url:
+    description: 'URL complète de /notify (ex: https://...render.com/notify)'
+    required: true
+  notify_token:
+    description: 'Token partagé pour sécuriser /notify'
+    required: true
+  runtime_minutes:
+    description: 'Durée restante de la session'
+    required: false
+    default: '355'
+  mode:
+    description: 'Mode de la session (SESSION_A, SESSION_B, RESTART_DE_SECOURS…)'
+    required: false
+    default: 'SESSION'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Run Command Dispatcher
+      shell: pwsh
+      env:
+        RDP_USER: Bullettemporary
+      run: |
+        # Configurer rclone via variables d'environnement
+        $env:RCLONE_CONFIG_MYREMOTE_TYPE = "b2"
+        $env:RCLONE_CONFIG_MYREMOTE_ACCOUNT = "${{ inputs.b2_application_key_id }}"
+        $env:RCLONE_CONFIG_MYREMOTE_KEY = "${{ inputs.b2_application_key }}"
+        $env:RCLONE_CONFIG_MYREMOTE_ENDPOINT = "${{ inputs.b2_endpoint }}"
+
+        $rclone = "${{ inputs.rclone_exe }}"
+        $remote = "myremote:${{ inputs.bucket }}"
+        $mode = "${{ inputs.mode }}".ToUpper()
+        $endTime = (Get-Date).AddMinutes([int]"${{ inputs.runtime_minutes }}")
+
+        # Définir les actions autorisées selon le mode
+        $allowed = @()
+        if ($mode -like "*SESSION*") {
+            $allowed = @("cmd", "stats", "screen", "get", "fix", "stop")
+        } elseif ($mode -like "*RESTART*") {
+            $allowed = @("stats", "fix", "stop")
+        } else {
+            $allowed = @("stop")
+        }
+
+        # Écrire mode.txt sur B2 pour informer le bot
+        "$mode" | Set-Content -Path "C:\temp\mode.txt"
+        & $rclone copy "C:\temp\mode.txt" "$remote/" --quiet
+
+        while ((Get-Date) -lt $endTime) {
+            # --- CMD ---
+            if (("cmd" -in $allowed) -and (& $rclone lsf "$remote/cmd.lock" 2>$null)) {
+                & $rclone copy "$remote/cmd.ps1" "C:\temp" --force --quiet
+                $output = powershell -File "C:\temp\cmd.ps1" | Out-String
+                $body = @{ token="${{ inputs.notify_token }}"; message="💻 CMD: $output" } | ConvertTo-Json
+                Invoke-RestMethod -Uri "${{ inputs.notify_url }}" -Method Post -Body $body -ContentType "application/json"
+                & $rclone delete "$remote/cmd.lock" --quiet
+                & $rclone delete "$remote/cmd.ps1" --quiet
+            }
+
+            # --- STATS ---
+            if (("stats" -in $allowed) -and (& $rclone lsf "$remote/stats.lock" 2>$null)) {
+                $cpu = (Get-WmiObject Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
+                $ramFree = [math]::Round((Get-WmiObject Win32_OperatingSystem).FreePhysicalMemory / 1MB, 2)
+                $body = @{ token="${{ inputs.notify_token }}"; message="📊 CPU: $cpu% | RAM libre: $ramFree Mo" } | ConvertTo-Json
+                Invoke-RestMethod -Uri "${{ inputs.notify_url }}" -Method Post -Body $body -ContentType "application/json"
+                & $rclone delete "$remote/stats.lock" --quiet
+            }
+
+            # --- SCREEN ---
+            if (("screen" -in $allowed) -and (& $rclone lsf "$remote/screen.lock" 2>$null)) {
+                python -c "import pyautogui; pyautogui.screenshot('C:/temp/screen.png')"
+                & $rclone copy "C:/temp/screen.png" "$remote/outputs/" --quiet
+                $body = @{ token="${{ inputs.notify_token }}"; message="📸 Capture envoyée sur B2." } | ConvertTo-Json
+                Invoke-RestMethod -Uri "${{ inputs.notify_url }}" -Method Post -Body $body -ContentType "application/json"
+                & $rclone delete "$remote/screen.lock" --quiet
+            }
+
+            # --- GET ---
+            if (("get" -in $allowed) -and (& $rclone lsf "$remote/get.lock" 2>$null)) {
+                $fileName = (& $rclone cat "$remote/get.txt")
+                & $rclone copy "C:\Users\$env:RDP_USER\Documents\$fileName" "$remote/outputs/" --quiet
+                $body = @{ token="${{ inputs.notify_token }}"; message="📂 $fileName copié sur B2." } | ConvertTo-Json
+                Invoke-RestMethod -Uri "${{ inputs.notify_url }}" -Method Post -Body $body -ContentType "application/json"
+                & $rclone delete "$remote/get.lock" --quiet
+            }
+
+            # --- FIX ---
+            if (("fix" -in $allowed) -and (& $rclone lsf "$remote/fix.lock" 2>$null)) {
+                pip install --upgrade pyautogui pynput requests --force-reinstall
+                $body = @{ token="${{ inputs.notify_token }}"; message="🔧 Réparation terminée." } | ConvertTo-Json
+                Invoke-RestMethod -Uri "${{ inputs.notify_url }}" -Method Post -Body $body -ContentType "application/json"
+                & $rclone delete "$remote/fix.lock" --quiet
+            }
+
+            # --- STOP (toujours actif) ---
+            if (& $rclone lsf "$remote/stop-now.lock" 2>$null) {
+                Write-Host "🛑 Signal d'arrêt détecté !"
+                & $rclone delete "$remote/stop-now.lock" --quiet
+                break
+            }
+
+            # Sauvegarde automatique légère (Documents)
+            $docPath = "C:\Users\$env:RDP_USER\Documents"
+            if (Test-Path $docPath) {
+                & $rclone sync $docPath "$remote/userdata/Documents" --quiet --size-only
+            }
+            Start-Sleep -Seconds 120
+        }
