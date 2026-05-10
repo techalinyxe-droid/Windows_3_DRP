@@ -109,18 +109,18 @@ jobs:
 
       # ---------- BOUCLE DE VIE + COMMANDES (conditions ajoutées) ----------
       - name: 🕹️ Boucle de commandes
-  uses: ./.github/actions/command-dispatcher
-  with:
-    rclone_exe: ${{ env.RCLONE_EXE }}
-    bucket: ${{ secrets.B2_BUCKET_NAME }}
-    b2_application_key_id: ${{ secrets.B2_APPLICATION_KEY_ID }}
-    b2_application_key: ${{ secrets.B2_APPLICATION_KEY }}
-    b2_endpoint: ${{ secrets.B2_ENDPOINT }}
-    notify_url: ${{ secrets.RENDER_URL }}/notify
-    notify_token: ${{ secrets.NOTIFY_TOKEN }}
-    runtime_minutes: ${{ inputs.runtime_minutes }}
-    mode: ${{ inputs.mode }}
-    
+        uses: ./.github/actions/command-dispatcher
+        with:
+          rclone_exe: ${{ env.RCLONE_EXE }}
+          bucket: ${{ secrets.B2_BUCKET_NAME }}
+          b2_application_key_id: ${{ secrets.B2_APPLICATION_KEY_ID }}
+          b2_application_key: ${{ secrets.B2_APPLICATION_KEY }}
+          b2_endpoint: ${{ secrets.B2_ENDPOINT }}
+          notify_url: ${{ secrets.RENDER_URL }}/notify
+          notify_token: ${{ secrets.NOTIFY_TOKEN }}
+          runtime_minutes: ${{ inputs.runtime_minutes }}
+          mode: ${{ inputs.mode }}
+
       # ---------- SAUVEGARDE FINALE & RELAIS ----------
       - name: 🔄 Sauvegarde finale & Relais (Ping-Pong)
         if: always()
