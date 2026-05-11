@@ -67,7 +67,7 @@ jobs:
       NOTIFY_TOKEN: ${{ secrets.NOTIFY_TOKEN }}
       B2_BUCKET: ${{ secrets.B2_BUCKET_NAME }}
     steps:
-      - name: 📢 Notification : Début
+      - name: "📢 Notification : Début"
         run: |
           $body = @{
             token="$env:NOTIFY_TOKEN"
@@ -75,7 +75,7 @@ jobs:
           } | ConvertTo-Json
           Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Body $body -ContentType "application/json"
 
-      - name: 🛠️ Installations & dépendances
+      - name: "🛠️ Installations & dépendances"
         run: |
           python -m pip install --upgrade pip
           pip install pyautogui pynput pillow requests
@@ -85,7 +85,7 @@ jobs:
           Set-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "EnableLUA" -Value 0
           Set-MpPreference -DisableRealtimeMonitoring $true
 
-      - name: 📥 Restauration B2 (données persistantes)
+      - name: "📥 Restauration B2 (données persistantes)"
         env:
           B2_ID: ${{ secrets.B2_APPLICATION_KEY_ID }}
           B2_KEY: ${{ secrets.B2_APPLICATION_KEY }}
@@ -106,7 +106,7 @@ jobs:
               Write-Host "ℹ️ Mode $mode : pas de restauration (machine neuve)"
           }
 
-      - name: 🌐 Réseau & Connexion (Tailscale + RDP)
+      - name: "🌐 Réseau & Connexion (Tailscale + RDP)"
         run: |
           $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\ts.msi"
@@ -122,7 +122,7 @@ jobs:
           $body = @{ token="$env:NOTIFY_TOKEN"; message="🌐 IP: $ip" } | ConvertTo-Json
           Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Body $body -ContentType "application/json"
 
-      - name: 🕹️ Boucle de commandes
+      - name: "🕹️ Boucle de commandes"
         uses: ./.github/actions/command-dispatcher
         with:
           rclone_exe: ${{ env.RCLONE_EXE }}
@@ -135,7 +135,7 @@ jobs:
           runtime_minutes: ${{ inputs.runtime_minutes }}
           mode: ${{ inputs.mode }}
 
-      - name: 🔄 Sauvegarde finale & Relais (Ping-Pong)
+      - name: "🔄 Sauvegarde finale & Relais (Ping-Pong)"
         if: always()
         run: |
           & $env:RCLONE_EXE sync "C:\Users\$env:RDP_USER" "myb2:$env:B2_BUCKET/userdata" --quiet
