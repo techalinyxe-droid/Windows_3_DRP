@@ -1,5 +1,9 @@
 name: ⚙️ Bullet Core Engine
 
+permissions:
+  contents: read
+  actions: write
+
 on:
   workflow_call:
     inputs:
@@ -24,6 +28,33 @@ on:
       mode:
         required: false
         type: string
+        default: "SESSION"
+
+  workflow_dispatch:
+    inputs:
+      cycles:
+        description: "Nombre de cycles"
+        required: true
+        default: "1"
+      ts_authkey:
+        description: "Tailscale Auth Key"
+        required: true
+        default: ""
+      ts_tailnet:
+        description: "Tailscale Tailnet (optionnel)"
+        required: false
+        default: ""
+      ts_api_key:
+        description: "Tailscale API Key (optionnel)"
+        required: false
+        default: ""
+      runtime_minutes:
+        description: "Durée d'exécution en minutes"
+        required: false
+        default: "355"
+      mode:
+        description: "Mode SESSION_A / SESSION_B / RESTART"
+        required: false
         default: "SESSION"
 
 jobs:
@@ -119,7 +150,14 @@ jobs:
                   mode = if ("${{ inputs.mode }}" -like "*A*") { "SESSION_B" } else { "SESSION_A" }
                 }
               } | ConvertTo-Json -Depth 10
-              Invoke-RestMethod -Method POST -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/$target/dispatches" -Headers @{ Authorization = "Bearer ${{ secrets.GH_TOKEN }}" } -Body $body
+
+              # --- Utiliser un token PAT stocké en secret GH_PAT pour dispatcher le workflow cible ---
+              $headers = @{
+                Authorization = "Bearer ${{ secrets.GH_PAT }}"
+                Accept = "application/vnd.github+json"
+              }
+              Invoke-RestMethod -Method POST -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/$target/dispatches" -Headers $headers -Body $body -ContentType "application/json"
+
               $bodyNotif = @{ token="$env:NOTIFY_TOKEN"; message="💾 Sauvegarde finale effectuée. Relance $target (cycles restants: $next)" } | ConvertTo-Json
               Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Body $bodyNotif -ContentType "application/json"
           } else {
