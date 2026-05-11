@@ -1,5 +1,4 @@
 name: 🔵 Bullet Session B
-
 on:
   workflow_dispatch:
     inputs:
@@ -9,6 +8,10 @@ on:
       cycles:
         description: 'Nombre de cycles'
         required: true
+
+permissions:
+  actions: write
+  contents: read
 
 jobs:
   run:
