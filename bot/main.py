@@ -49,28 +49,21 @@ AVAILABLE_MODELS = [
 current_model = os.environ.get("HF_MODEL", AVAILABLE_MODELS[0])
 
 # ------------------------------------------------------------------
-# AJOUT : Bibliothèque des 16 scripts maîtres (templates PowerShell)
+# Bibliothèque des 16 scripts maîtres (templates PowerShell)
 # ------------------------------------------------------------------
 SCRIPTS_LIBRARY = {
-    # Analyse
     "s_anal_disk": "Get-ChildItem -Path 'C:/{arg}' -Recurse -ErrorAction SilentlyContinue | Sort-Object Length -Descending | Select-Object Name, @{{Name='Size(MB)';Expression={{[Math]::Round($_.Length / 1MB, 2)}}}} -First 15",
     "s_anal_perf": "Get-Process | Sort-Object CPU -Descending | Select-Object -First 10 | Select-Object ProcessName, @{{Name='CPU(%)';Expression={{[Math]::Round($_.CPU, 1)}}}}, @{{Name='RAM(MB)';Expression={{[Math]::Round($_.WorkingSet / 1MB, 1)}}}}",
     "s_anal_net": "Test-NetConnection -ComputerName 8.8.8.8; Get-NetTCPConnection | Where-Object {{$_.State -eq 'Established'}} | Select-Object LocalAddress, LocalPort, RemoteAddress, RemotePort",
     "s_anal_ia": "Select-String -Path 'C:/Users/$env:RDP_USER/Desktop/*.log' -Pattern '{arg}' -Context 2,2 | Select-Object -Last 10",
-
-    # Fichiers
     "s_get_file": "& $env:RCLONE_EXE copy 'C:/Users/$env:RDP_USER/{arg}' 'myb2:$env:B2_BUCKET/outputs/' --progress",
     "s_dl_b2": "& $env:RCLONE_EXE copy 'myb2:$env:B2_BUCKET/{arg}' 'C:/Users/$env:RDP_USER/Downloads/' --force",
     "s_zip_folder": "Compress-Archive -Path 'C:/Users/$env:RDP_USER/{arg}' -DestinationPath 'C:/temp/archive.zip' -Force; & $env:RCLONE_EXE move 'C:/temp/archive.zip' 'myb2:$env:B2_BUCKET/outputs/'",
     "s_search": "Get-ChildItem -Path 'C:/Users/$env:RDP_USER/' -Filter '*{arg}*' -Recurse -ErrorAction SilentlyContinue | Select-Object FullName",
-
-    # Système & Réparation
     "s_fix_pip": "python -m pip install --upgrade pip; pip install {arg} --force-reinstall",
     "s_kill_task": "Stop-Process -Name '{arg}' -Force -ErrorAction SilentlyContinue",
     "s_sys_info": "Get-ComputerInfo | Select-Object OsName, OsVersion, CsProcessors, @{{Name='Uptime';Expression={{(Get-Date) - (Get-Uptime)}}}}",
     "s_clean_tmp": "Remove-Item -Path 'C:/Users/$env:RDP_USER/AppData/Local/Temp/*' -Recurse -Force; Write-Host 'Nettoyage Temp terminé.'",
-
-    # Automatisation
     "s_auto_run": "Start-Process python.exe -ArgumentList 'C:/Users/$env:RDP_USER/Desktop/{arg}'",
     "s_firewall": "netsh advfirewall firewall add rule name='Open_{arg}' dir=in action=allow protocol=TCP localport={arg}",
     "s_screenshot": "python -c 'import pyautogui; pyautogui.screenshot(\"C:/temp/screen.png\")'; & $env:RCLONE_EXE move 'C:/temp/screen.png' 'myb2:$env:B2_BUCKET/outputs/'",
@@ -117,24 +110,44 @@ def trigger_workflow(workflow_id):
     headers = {"Authorization": f"Bearer {GH_TOKEN}", "Accept": "application/vnd.github+json"}
     url_check = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/workflows/{workflow_id}/runs?status=in_progress"
     
-    if requests.get(url_check, headers=headers).json().get("total_count", 0) > 0:
-        return "⚠️ Ce workflow est déjà en cours."
-    
+    # Vérifier qu'il n'y a pas déjà un run en cours pour ce workflow
+    try:
+        if requests.get(url_check, headers=headers).json().get("total_count", 0) > 0:
+            return "⚠️ Ce workflow est déjà en cours."
+    except:
+        pass  # si la vérif échoue, on continue quand même
+
     ok, mins = check_cooldown()
-    if not ok: return f"⏳ Cooldown actif : attends encore {mins} min."
+    if not ok:
+        return f"⏳ Cooldown actif : attends encore {mins} min."
 
     url_dispatch = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/actions/workflows/{workflow_id}/dispatches"
     
-    inputs = {
-        "runtime_minutes": "355",
-        "ts_tailnet": TS_TAILNET,
-        "ts_authkey": TS_AUTHKEY,
-        "ts_api_key": TS_API_KEY
-    }
-    
+    # Construire les inputs selon le workflow appelé
+    inputs = {}
+    if workflow_id in ("session-A.yml", "session-B.yml"):
+        inputs = {
+            "ts_authkey": TS_AUTHKEY,
+            "cycles": "1"          # peut être changé si nécessaire
+        }
+    elif workflow_id == "restart.yml":
+        inputs = {
+            "ts_authkey": TS_AUTHKEY,
+            "cycles": "0"
+        }
+    else:
+        # Pour d'autres workflows éventuels, on laisse les anciens (mais ils ne devraient plus être utilisés)
+        inputs = {
+            "ts_authkey": TS_AUTHKEY,
+            "cycles": "1"
+        }
+
     res = requests.post(url_dispatch, headers=headers, json={"ref": "main", "inputs": inputs})
     if res.status_code == 204:
-        b2_client.put_object(Bucket=B2_BUCKET_NAME, Key='cooldown.txt', Body='updated')
+        try:
+            b2_client.put_object(Bucket=B2_BUCKET_NAME, Key='cooldown.txt', Body='updated')
+        except:
+            pass
         return f"🚀 Démarrage réussi de {workflow_id} !"
     
     try:
@@ -219,8 +232,9 @@ def h_model(m):
             
     bot.reply_to(m, f"❌ Modèle non trouvé. Utilise /models pour voir la liste.")
 
+# --------- CORRECTION ---------
 @bot.message_handler(commands=['start'])
-def h_start(m): bot.reply_to(m, trigger_workflow('rdp-tailscale-rustdesk-A.yml'))
+def h_start(m): bot.reply_to(m, trigger_workflow('session-A.yml'))
 
 @bot.message_handler(commands=['restart'])
 def h_restart(m): bot.reply_to(m, trigger_workflow('restart.yml'))
@@ -232,9 +246,11 @@ def h_stop(m):
 
 @bot.message_handler(commands=['status'])
 def h_status(m):
-    s_full = get_workflow_status('rdp-tailscale-rustdesk-A.yml')
+    s_a = get_workflow_status('session-A.yml')
+    s_b = get_workflow_status('session-B.yml')
     s_rest = get_workflow_status('restart.yml')
-    bot.reply_to(m, f"📊 **Statut**\nFull: {s_full}\nRestart: {s_rest}", parse_mode="Markdown")
+    bot.reply_to(m, f"📊 **Statut**\nSession A: {s_a}\nSession B: {s_b}\nRestart: {s_rest}", parse_mode="Markdown")
+# ------------------------------
 
 @bot.message_handler(commands=['files'])
 def h_files(m):
@@ -325,14 +341,10 @@ def execute_script_engine(m):
     argument = parts[1] if len(parts) > 1 else ""
 
     if cmd_name in SCRIPTS_LIBRARY:
-        # Si le script demande un argument et qu'il est vide
         if "{arg}" in SCRIPTS_LIBRARY[cmd_name] and not argument:
             bot.reply_to(m, f"⚠️ Ce script demande un argument.\nExemple : `/{cmd_name} mon_texte_ou_chemin`")
             return
-
-        # Préparation du PowerShell final
         ps_code = SCRIPTS_LIBRARY[cmd_name].replace("{arg}", argument)
-        
         try:
             b2_client.put_object(Bucket=B2_BUCKET_NAME, Key='cmd.ps1', Body=ps_code)
             b2_client.put_object(Bucket=B2_BUCKET_NAME, Key='cmd.lock', Body='lock')
@@ -367,7 +379,11 @@ def h_settings(m):
 @bot.message_handler(func=lambda message: True)
 def handle_ai(message):
     bot.send_chat_action(message.chat.id, 'typing')
-    status_info = f"Full: {get_workflow_status('rdp-tailscale-rustdesk-A.yml')}, Restart: {get_workflow_status('restart.yml')}"
+    # --------- CORRECTION ---------
+    status_info = (f"Session A: {get_workflow_status('session-A.yml')}, "
+                   f"Session B: {get_workflow_status('session-B.yml')}, "
+                   f"Restart: {get_workflow_status('restart.yml')}")
+    # ------------------------------
     
     system_prompt = f"""Tu es l'IA du serveur "Bullet". 
     Statut actuel: {status_info}.
@@ -385,8 +401,10 @@ def handle_ai(message):
         if match:
             action_data = json.loads(match.group())
             act = action_data.get("action")
-            if act == "start_full": bot.send_message(message.chat.id, trigger_workflow('rdp-tailscale-rustdesk-A.yml'))
+            # --------- CORRECTION ---------
+            if act == "start_full": bot.send_message(message.chat.id, trigger_workflow('session-A.yml'))
             elif act == "start_restart": bot.send_message(message.chat.id, trigger_workflow('restart.yml'))
+            # ------------------------------
             elif act == "stop_session": h_stop(message)
             elif act == "get_status": h_status(message)
             content = content[:match.start()].strip()
