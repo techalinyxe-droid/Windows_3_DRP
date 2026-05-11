@@ -67,15 +67,19 @@ jobs:
       NOTIFY_TOKEN: ${{ secrets.NOTIFY_TOKEN }}
       B2_BUCKET: ${{ secrets.B2_BUCKET_NAME }}
     steps:
-      - name: "📢 Notification : Début"
+      # ---------- NOTIFICATION DÉMARRAGE ----------
+      - name: 📢 Notification : Début
         run: |
-          $body = @{
-            token="$env:NOTIFY_TOKEN"
-            message="🚀 ${{ inputs.mode }} démarrée (Cycles: ${{ inputs.cycles }})"
-          } | ConvertTo-Json
-          Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Body $body -ContentType "application/json"
+          $headers = @{ Authorization = "Bearer $env:NOTIFY_TOKEN" }
+          $body = @{ message="🚀 ${{ inputs.mode }} démarrée (Cycles: ${{ inputs.cycles }})" } | ConvertTo-Json
+          try {
+            Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Headers $headers -Body $body -ContentType "application/json" -ErrorAction Stop
+          } catch {
+            Write-Warning "Notification de démarrage échouée : $_"
+          }
 
-      - name: "🛠️ Installations & dépendances"
+      # ---------- INSTALLATIONS ----------
+      - name: 🛠️ Installations & dépendances
         run: |
           python -m pip install --upgrade pip
           pip install pyautogui pynput pillow requests
@@ -85,44 +89,57 @@ jobs:
           Set-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "EnableLUA" -Value 0
           Set-MpPreference -DisableRealtimeMonitoring $true
 
-      - name: "📥 Restauration B2 (données persistantes)"
+      # ---------- RESTAURATION B2 (conditionnée au mode RESTART) ----------
+      - name: 📥 Restauration B2 (données persistantes)
         env:
           B2_ID: ${{ secrets.B2_APPLICATION_KEY_ID }}
           B2_KEY: ${{ secrets.B2_APPLICATION_KEY }}
         run: |
           Invoke-WebRequest -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile "$env:TEMP\rclone.zip"
           Expand-Archive -Path "$env:TEMP\rclone.zip" -DestinationPath "$env:TEMP\rclone" -Force
-          $rclone = (Get-ChildItem "$env:TEMP\rclone\rclone-*\rclone.exe" | Select-Object -First 1).FullName
-          "RCLONE_EXE=$rclone" | Out-File -Append $env:GITHUB_ENV
+          $rcloneExe = (Get-ChildItem "$env:TEMP\rclone\rclone-*\rclone.exe" | Select-Object -First 1).FullName
+          "RCLONE_EXE=$rcloneExe" | Out-File -Append $env:GITHUB_ENV
+          Write-Host "✅ rclone installé : $rcloneExe"
+
           $env:RCLONE_CONFIG_MYB2_TYPE = "b2"
           $env:RCLONE_CONFIG_MYB2_ACCOUNT = $env:B2_ID
           $env:RCLONE_CONFIG_MYB2_KEY = $env:B2_KEY
           $env:RCLONE_CONFIG_MYB2_ENDPOINT = ${{ secrets.B2_ENDPOINT }}
+
           $mode = "${{ inputs.mode }}".ToUpper()
           if ($mode -like "*RESTART*") {
-              & $rclone copy "myb2:$env:B2_BUCKET/userdata" "C:\Users\$env:RDP_USER" --create-empty-src-dirs --fast-list
+              Write-Host "📥 Restauration des données..."
+              & "$rcloneExe" copy "myb2:$env:B2_BUCKET/userdata" "C:\Users\$env:RDP_USER" --create-empty-src-dirs --fast-list
               Write-Host "✅ Données restaurées depuis B2 (mode $mode)"
           } else {
               Write-Host "ℹ️ Mode $mode : pas de restauration (machine neuve)"
           }
 
-      - name: "🌐 Réseau & Connexion (Tailscale + RDP)"
+      # ---------- RÉSEAU & CONNEXION ----------
+      - name: 🌐 Réseau & Connexion (Tailscale + RDP)
         run: |
           $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\ts.msi"
           Start-Process msiexec.exe -ArgumentList "/i","$env:TEMP\ts.msi","/quiet" -Wait
           & "C:\Program Files\Tailscale\tailscale.exe" up --authkey "${{ inputs.ts_authkey }}" --hostname "bullet" --accept-dns=true
+
           $sec = ConvertTo-SecureString "${{ secrets.RDP_PASSWORD }}" -AsPlainText -Force
           New-LocalUser -Name "$env:RDP_USER" -Password $sec -AccountNeverExpires -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Administrators" -Member "$env:RDP_USER" -ErrorAction SilentlyContinue
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          # 🔧 Correction : éviter l'opérateur & dans le YAML
-          $ip = cmd /c '"C:\Program Files\Tailscale\tailscale.exe" ip -4'
-          $body = @{ token="$env:NOTIFY_TOKEN"; message="🌐 IP: $ip" } | ConvertTo-Json
-          Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Body $body -ContentType "application/json"
 
-      - name: "🕹️ Boucle de commandes"
+          $ip = cmd /c '"C:\Program Files\Tailscale\tailscale.exe" ip -4'
+          $headers = @{ Authorization = "Bearer $env:NOTIFY_TOKEN" }
+          $body = @{ message="🌐 IP: $ip" } | ConvertTo-Json
+          try {
+            Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Headers $headers -Body $body -ContentType "application/json" -ErrorAction Stop
+          } catch {
+            Write-Warning "Notification IP échouée : $_"
+          }
+
+      # ---------- BOUCLE DE COMMANDES ----------
+      - name: 🕹️ Boucle de commandes
         uses: ./.github/actions/command-dispatcher
         with:
           rclone_exe: ${{ env.RCLONE_EXE }}
@@ -135,10 +152,15 @@ jobs:
           runtime_minutes: ${{ inputs.runtime_minutes }}
           mode: ${{ inputs.mode }}
 
-      - name: "🔄 Sauvegarde finale & Relais (Ping-Pong)"
+      # ---------- SAUVEGARDE FINALE & RELAIS ----------
+      - name: 🔄 Sauvegarde finale & Relais (Ping-Pong)
         if: always()
         run: |
-          & $env:RCLONE_EXE sync "C:\Users\$env:RDP_USER" "myb2:$env:B2_BUCKET/userdata" --quiet
+          if (-not (Test-Path $env:RCLONE_EXE)) {
+            Write-Error "rclone introuvable à $env:RCLONE_EXE"
+            exit 1
+          }
+          & "$env:RCLONE_EXE" sync "C:\Users\$env:RDP_USER" "myb2:$env:B2_BUCKET/userdata" --quiet
           $c = [int]"${{ inputs.cycles }}"
           if ($c -gt 0) {
               $next = $c - 1
@@ -156,9 +178,21 @@ jobs:
                 Accept = "application/vnd.github+json"
               }
               Invoke-RestMethod -Method POST -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/$target/dispatches" -Headers $headers -Body $body -ContentType "application/json"
-              $bodyNotif = @{ token="$env:NOTIFY_TOKEN"; message="💾 Sauvegarde finale effectuée. Relance $target (cycles restants: $next)" } | ConvertTo-Json
-              Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Body $bodyNotif -ContentType "application/json"
+
+              # Notification relais
+              $notifHeaders = @{ Authorization = "Bearer $env:NOTIFY_TOKEN" }
+              $bodyNotif = @{ message="💾 Sauvegarde finale effectuée. Relance $target (cycles restants: $next)" } | ConvertTo-Json
+              try {
+                Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Headers $notifHeaders -Body $bodyNotif -ContentType "application/json" -ErrorAction Stop
+              } catch {
+                Write-Warning "Notification relais échouée : $_"
+              }
           } else {
-              $bodyNotif = @{ token="$env:NOTIFY_TOKEN"; message="🛑 Session terminée." } | ConvertTo-Json
-              Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Body $bodyNotif -ContentType "application/json"
+              $notifHeaders = @{ Authorization = "Bearer $env:NOTIFY_TOKEN" }
+              $bodyNotif = @{ message="🛑 Session terminée." } | ConvertTo-Json
+              try {
+                Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Headers $notifHeaders -Body $bodyNotif -ContentType "application/json" -ErrorAction Stop
+              } catch {
+                Write-Warning "Notification de fin échouée : $_"
+              }
           }
