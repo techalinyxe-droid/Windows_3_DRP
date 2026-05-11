@@ -117,7 +117,8 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member "$env:RDP_USER" -ErrorAction SilentlyContinue
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          $ip = (& "C:\Program Files\Tailscale\tailscale.exe" ip -4)
+          # 🔧 Correction : éviter l'opérateur & dans le YAML
+          $ip = cmd /c '"C:\Program Files\Tailscale\tailscale.exe" ip -4'
           $body = @{ token="$env:NOTIFY_TOKEN"; message="🌐 IP: $ip" } | ConvertTo-Json
           Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Body $body -ContentType "application/json"
 
@@ -150,14 +151,11 @@ jobs:
                   mode = if ("${{ inputs.mode }}" -like "*A*") { "SESSION_B" } else { "SESSION_A" }
                 }
               } | ConvertTo-Json -Depth 10
-
-              # --- Utiliser un token PAT stocké en secret GH_PAT pour dispatcher le workflow cible ---
               $headers = @{
                 Authorization = "Bearer ${{ secrets.GH_PAT }}"
                 Accept = "application/vnd.github+json"
               }
               Invoke-RestMethod -Method POST -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/$target/dispatches" -Headers $headers -Body $body -ContentType "application/json"
-
               $bodyNotif = @{ token="$env:NOTIFY_TOKEN"; message="💾 Sauvegarde finale effectuée. Relance $target (cycles restants: $next)" } | ConvertTo-Json
               Invoke-RestMethod -Uri $env:NOTIFY_URL -Method Post -Body $bodyNotif -ContentType "application/json"
           } else {
